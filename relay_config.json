@@ -1,0 +1,9 @@
+{
+  "enabled": false,
+  "host": "SEU_DOMINIO_DO_RELAY",
+  "port": 443,
+  "tls": true,
+  "server_name": "SEU_DOMINIO_DO_RELAY",
+  "ca_file": "",
+  "allow_insecure_dev": false
+}

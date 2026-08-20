@@ -1,0 +1,1 @@
+# O relay usa somente a biblioteca padrão do Python 3.11+.
