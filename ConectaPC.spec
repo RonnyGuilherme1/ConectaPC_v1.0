@@ -5,7 +5,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets', 'assets')],
+    datas=[('assets', 'assets'), ('relay_config.json', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

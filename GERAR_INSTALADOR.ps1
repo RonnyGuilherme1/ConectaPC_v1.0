@@ -1,9 +1,10 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
+. "$PSScriptRoot\ASSINATURA.ps1"
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host " ConectaPC 2.0.0 - Gerador de Instalador Windows" -ForegroundColor Cyan
+Write-Host " ConectaPC 2.1.0 - Gerador de Instalador Windows" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -102,7 +103,7 @@ if ($LASTEXITCODE -ne 0) { throw "Falha ao atualizar pip." }
 & $venvPython -m pip install -r requirements.txt
 if ($LASTEXITCODE -ne 0) { throw "Falha ao instalar dependencias do ConectaPC." }
 
-& $venvPython -m pip install pyinstaller
+& $venvPython -m pip install pyinstaller==6.22.2
 if ($LASTEXITCODE -ne 0) { throw "Falha ao instalar PyInstaller." }
 
 Write-Host "[3/5] Gerando ConectaPC.exe..." -ForegroundColor Green
@@ -135,6 +136,8 @@ if ($LASTEXITCODE -ne 0) {
 if (-not (Test-Path "dist\ConectaPC\ConectaPC.exe")) {
     throw "Falha ao gerar dist\ConectaPC\ConectaPC.exe"
 }
+
+Sign-ConectaPCArtifact (Join-Path $PSScriptRoot "dist\ConectaPC\ConectaPC.exe")
 
 Write-Host "[4/5] Localizando Inno Setup..." -ForegroundColor Green
 $iscc = Find-InnoSetupCompiler
@@ -192,14 +195,16 @@ if ($LASTEXITCODE -ne 0) {
     throw "O compilador do Inno Setup terminou com erro."
 }
 
-$setup = Join-Path $PSScriptRoot "dist_installer\ConectaPC_Setup_v2.0.0.exe"
+$setup = Join-Path $PSScriptRoot "dist_installer\ConectaPC_Setup_v2.1.0.exe"
 if (-not (Test-Path $setup)) {
     throw "O instalador final nao foi gerado."
 }
 
+Sign-ConectaPCArtifact $setup
+
 $hash = (Get-FileHash $setup -Algorithm SHA256).Hash
 $hashFile = Join-Path $PSScriptRoot "dist_installer\SHA256.txt"
-"ConectaPC_Setup_v2.0.0.exe  SHA256=$hash" | Set-Content $hashFile -Encoding UTF8
+"ConectaPC_Setup_v2.1.0.exe  SHA256=$hash" | Set-Content $hashFile -Encoding UTF8
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan

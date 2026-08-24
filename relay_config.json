@@ -5,5 +5,11 @@
   "tls": true,
   "server_name": "SEU_DOMINIO_DO_RELAY",
   "ca_file": "",
-  "allow_insecure_dev": false
+  "allow_insecure_dev": false,
+  "enrollment_token": "",
+  "updates": {
+    "manifest_url": "",
+    "public_key": "",
+    "allow_insecure_dev": false
+  }
 }

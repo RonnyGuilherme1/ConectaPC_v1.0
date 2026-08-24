@@ -1,113 +1,80 @@
-# Publicar o ConectaPC Relay em uma VPS Ubuntu
-
-## Arquitetura
-
-O ConectaPC 2.0 tenta:
-
-1. localizar o ID diretamente na LAN;
-2. se não encontrar, pedir ao relay o computador daquele ID;
-3. o PC remoto abre uma conexão de saída para o relay;
-4. o relay liga os dois fluxos;
-5. ID/PIN e consentimento continuam sendo validados no aplicativo remoto.
-
-Não há banco de dados. A lista de IDs online fica somente na memória do servidor.
+# Publicar o ConectaPC Relay em Ubuntu
 
 ## Requisitos
 
-- Ubuntu 22.04/24.04 ou equivalente
-- Python 3.11+
-- IP público
-- porta TCP 443 liberada
-- recomendado: domínio como `relay.seudominio.com.br`
-- certificado TLS válido
+- Ubuntu 22.04/24.04 ou equivalente;
+- Python 3.11+;
+- domínio público apontado para a VPS;
+- porta TCP 443;
+- certificado TLS público válido.
 
-## Instalação básica
+## Instalação
 
     sudo useradd --system --home /opt/conectapc-relay --shell /usr/sbin/nologin conectapc
     sudo mkdir -p /opt/conectapc-relay /etc/conectapc
-    sudo cp relay_server.py /opt/conectapc-relay/
+    sudo cp relay_server.py security_store.py manage_security.py /opt/conectapc-relay/
     sudo chown -R conectapc:conectapc /opt/conectapc-relay
 
-Coloque o certificado e a chave em:
-
-    /etc/conectapc/relay.crt
-    /etc/conectapc/relay.key
-
-Permissões:
+Instale o certificado e a chave em `/etc/conectapc/relay.crt` e `/etc/conectapc/relay.key`:
 
     sudo chown root:conectapc /etc/conectapc/relay.crt /etc/conectapc/relay.key
     sudo chmod 640 /etc/conectapc/relay.crt /etc/conectapc/relay.key
 
-Copie o serviço:
+Instale o serviço:
 
     sudo cp systemd/conectapc-relay.service /etc/systemd/system/
     sudo systemctl daemon-reload
     sudo systemctl enable --now conectapc-relay
-
-Ver logs:
-
-    sudo journalctl -u conectapc-relay -f
-
-## Firewall
-
-Com UFW:
-
     sudo ufw allow 443/tcp
 
-## Certificado público
+O systemd cria `/var/lib/conectapc` com acesso restrito ao serviço. Não use `--allow-plain` em produção.
 
-A opção mais prática para uso real é um domínio apontando para a VPS e um
-certificado emitido por uma autoridade confiável. Depois copie o certificado
-e a chave para `/etc/conectapc/`.
+Configure também `CONECTAPC_AUDIT_KEY` por `EnvironmentFile` protegido pelo root para que a chave usada na pseudonimização das origens não fique no próprio banco.
 
-O aplicativo Windows usa a validação TLS normal do sistema.
+    sudo sh -c 'umask 027; printf "CONECTAPC_AUDIT_KEY=%s\n" "$(openssl rand -hex 32)" > /etc/conectapc/relay.env'
+    sudo chown root:conectapc /etc/conectapc/relay.env
+    sudo chmod 640 /etc/conectapc/relay.env
 
-## Certificado autoassinado para laboratório
+## Primeiro técnico com MFA
 
-Existe `GERAR_CERTIFICADO_TESTE.sh`.
+    sudo -u conectapc python3 /opt/conectapc-relay/manage_security.py \
+      --db /var/lib/conectapc/relay.db \
+      add-technician suporte --name "Nome do técnico"
 
-Exemplo:
+Cadastre o segredo TOTP exibido no autenticador e guarde os códigos de recuperação segundo a política da empresa.
 
-    chmod +x GERAR_CERTIFICADO_TESTE.sh
-    ./GERAR_CERTIFICADO_TESTE.sh 203.0.113.10
+## Cadastrar um cliente
 
-ou:
+    sudo -u conectapc python3 /opt/conectapc-relay/manage_security.py \
+      --db /var/lib/conectapc/relay.db \
+      create-enrollment --label "Cliente - Computador" --hours 24
 
-    ./GERAR_CERTIFICADO_TESTE.sh relay.seudominio.com.br
+O código é de uso único. O cliente deve colá-lo em **Cadastrar este computador**.
 
-Depois:
+## Revogação
 
-1. instale `relay.crt` e `relay.key` no servidor;
-2. copie somente `relay.crt` para a raiz do projeto Windows;
-3. em `relay_config.json`, defina:
+    sudo -u conectapc python3 /opt/conectapc-relay/manage_security.py \
+      --db /var/lib/conectapc/relay.db disable-technician usuario
 
-       "tls": true,
-       "ca_file": "relay.crt",
-       "server_name": "203.0.113.10"
+    sudo -u conectapc python3 /opt/conectapc-relay/manage_security.py \
+      --db /var/lib/conectapc/relay.db disable-device 123456789
 
-4. gere novamente o ConectaPC.exe.
+Revogar no banco bloqueia novos acessos. Para derrubar imediatamente conexões TCP já estabelecidas, reinicie o serviço enquanto não houver um canal administrativo dedicado:
 
-Nunca distribua `relay.key` para clientes.
+    sudo systemctl restart conectapc-relay
 
-## Segurança desta versão
+## Operação
 
-- conexão cliente ↔ relay protegida por TLS quando configurada corretamente;
-- o servidor não armazena IDs permanentemente;
-- PIN não é enviado no registro do ID;
-- o PC remoto continua exibindo a solicitação de consentimento;
-- sessões possuem tokens aleatórios temporários;
-- não existe acesso oculto ou não assistido.
+    sudo systemctl status conectapc-relay
+    sudo journalctl -u conectapc-relay -f
 
-Importante: TLS nesta versão termina no relay. Portanto, esta versão ainda não
-é criptografia ponta a ponta entre os dois PCs. Antes de usar como produto
-comercial em larga escala, o próximo passo deve adicionar uma camada E2E
-autenticada entre os clientes.
+O relay registra metadados de auditoria em SQLite e retém 90 dias por padrão. Faça backup criptografado de `/var/lib/conectapc/relay.db`, monitore CPU/memória/banda, expiração TLS, falhas de login e volume de sessões.
 
-## Capacidade
+O relay permanece de processo único e memória local. Antes de alta disponibilidade/horizontalização, será necessário um coordenador compartilhado para presença e sessões.
 
-O relay retransmite a tela inteira, então largura de banda importa.
+## Laboratório local
 
-Exemplo aproximado: 10 sessões usando 2 Mbit/s cada consomem cerca de
-20 Mbit/s de entrada e 20 Mbit/s de saída no VPS.
+    python relay_server.py --host 127.0.0.1 --port 45443 --allow-plain --db relay-test.db
+    python TESTAR_RELAY_LOCAL.py 127.0.0.1 45443 relay-test.db
 
-Comece pequeno e meça o uso real.
+O teste valida cadastro de dispositivos, MFA, autorização, identidades declaradas e túnel bidirecional. A criptografia E2E é validada pelos testes unitários do projeto.

@@ -964,6 +964,10 @@
    'C:\\Users\\Suporte - '
    'Conecta\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\inspect.py',
    'PYMODULE'),
+  ('internet',
+   'C:\\Users\\Suporte - '
+   'Conecta\\Documents\\PROJETO\\ConectaPC_v1.0\\internet.py',
+   'PYMODULE'),
   ('ipaddress',
    'C:\\Users\\Suporte - '
    'Conecta\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\ipaddress.py',

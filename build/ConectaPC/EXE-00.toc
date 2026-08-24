@@ -5,7 +5,7 @@
  True,
  ['C:\\Users\\Suporte - '
   'Conecta\\Documents\\PROJETO\\ConectaPC_v1.0\\assets/conectapc.ico'],
- versioninfo.VSVersionInfo(ffi=versioninfo.FixedFileInfo(filevers=(1, 0, 0, 0), prodvers=(1, 0, 0, 0), mask=0x3f, flags=0x0, OS=0x40004, fileType=1, subtype=0x0, date=(0, 0)), kids=[versioninfo.StringFileInfo([versioninfo.StringTable('041604E4', [versioninfo.StringStruct('CompanyName', 'ConectaPC'), versioninfo.StringStruct('FileDescription', 'ConectaPC - Suporte Remoto'), versioninfo.StringStruct('FileVersion', '1.0.0'), versioninfo.StringStruct('InternalName', 'ConectaPC'), versioninfo.StringStruct('LegalCopyright', 'ConectaPC'), versioninfo.StringStruct('OriginalFilename', 'ConectaPC.exe'), versioninfo.StringStruct('ProductName', 'ConectaPC'), versioninfo.StringStruct('ProductVersion', '1.0.0')])]), versioninfo.VarFileInfo([versioninfo.VarStruct('Translation', [1046, 1252])])]),
+ versioninfo.VSVersionInfo(ffi=versioninfo.FixedFileInfo(filevers=(2, 0, 0, 0), prodvers=(2, 0, 0, 0), mask=0x3f, flags=0x0, OS=0x40004, fileType=1, subtype=0x0, date=(0, 0)), kids=[versioninfo.StringFileInfo([versioninfo.StringTable('041604E4', [versioninfo.StringStruct('CompanyName', 'ConectaPC'), versioninfo.StringStruct('FileDescription', 'ConectaPC - Suporte Remoto'), versioninfo.StringStruct('FileVersion', '2.0.0'), versioninfo.StringStruct('InternalName', 'ConectaPC'), versioninfo.StringStruct('LegalCopyright', 'ConectaPC'), versioninfo.StringStruct('OriginalFilename', 'ConectaPC.exe'), versioninfo.StringStruct('ProductName', 'ConectaPC'), versioninfo.StringStruct('ProductVersion', '2.0.0')])]), versioninfo.VarFileInfo([versioninfo.VarStruct('Translation', [1046, 1252])])]),
  False,
  False,
  b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<assembly xmlns='
@@ -88,7 +88,7 @@
  [],
  False,
  False,
- 1787254823,
+ 1787314903,
  [('runw.exe',
    'C:\\Users\\Suporte - '
    'Conecta\\Documents\\PROJETO\\ConectaPC_v1.0\\.buildenv\\Lib\\site-packages\\PyInstaller\\bootloader\\Windows-64bit-intel\\runw.exe',

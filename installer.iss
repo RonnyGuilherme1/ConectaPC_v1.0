@@ -1,5 +1,5 @@
 #define MyAppName "ConectaPC"
-#define MyAppVersion "2.0.0"
+#define MyAppVersion "2.1.0"
 #define MyAppPublisher "ConectaPC"
 #define MyAppExeName "ConectaPC.exe"
 
@@ -13,7 +13,7 @@ DefaultDirName={autopf}\ConectaPC
 DefaultGroupName=ConectaPC
 DisableProgramGroupPage=yes
 OutputDir=dist_installer
-OutputBaseFilename=ConectaPC_Setup_v2.0.0
+OutputBaseFilename=ConectaPC_Setup_v2.1.0
 SetupIconFile=assets\conectapc.ico
 UninstallDisplayIcon={app}\ConectaPC.exe
 WizardStyle=modern
@@ -51,3 +51,16 @@ Filename: "{app}\ConectaPC.exe"; Description: "Abrir o ConectaPC"; Flags: nowait
 [UninstallRun]
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""ConectaPC TCP LAN"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""ConectaPC UDP LAN"""; Flags: runhidden waituntilterminated
+
+[Code]
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  UpdateDir: String;
+begin
+  if CurStep = ssPostInstall then
+  begin
+    UpdateDir := ExpandConstant('{localappdata}\ConectaPC\updates');
+    ForceDirectories(UpdateDir);
+    FileCopy(ExpandConstant('{srcexe}'), UpdateDir + '\current_setup.exe', False);
+  end;
+end;

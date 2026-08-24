@@ -72,12 +72,13 @@ def load_relay_config(default_path):
 class RelayClient:
     """Mantém o ID deste ConectaPC registrado no servidor e abre túneis sob demanda.
 
-    O servidor não conhece PIN nem precisa de banco de dados. O PIN continua sendo
-    validado pelo computador remoto dentro do túnel.
+    O relay autentica dispositivos e técnicos, mas o código temporário continua
+    criptografado e é validado somente pelo computador remoto dentro do túnel.
     """
 
-    def __init__(self, session_id, host_service, bridge, config_path, app_version):
+    def __init__(self, session_id, identity, host_service, bridge, config_path, app_version):
         self.session_id = session_id
+        self.identity = identity
         self.host_service = host_service
         self.bridge = bridge
         self.config_path = config_path
@@ -89,6 +90,8 @@ class RelayClient:
         self.control_sock = None
         self.control_lock = threading.Lock()
         self.last_error = ""
+        self.access_token = ""
+        self.technician_name = ""
 
     @property
     def enabled(self):
@@ -189,11 +192,17 @@ class RelayClient:
                     "id": self.session_id,
                     "name": socket.gethostname(),
                     "version": self.app_version,
+                    "public_key": self.identity.public_key,
+                    "device_token": self.identity.device_token,
+                    "enrollment_token": str(self.config.get("enrollment_token") or ""),
                 }, self.control_lock)
 
                 reply = recv_control(sock)
                 if not reply.get("ok"):
                     raise RelayError(reply.get("error") or "Registro recusado pelo servidor.")
+                if reply.get("device_token"):
+                    self.identity.set_device_token(str(reply["device_token"]))
+                    self.config["enrollment_token"] = ""
 
                 sock.settimeout(15)
                 self.ready_event.set()
@@ -213,10 +222,12 @@ class RelayClient:
                     if msg_type == "incoming":
                         token = str(msg.get("session") or "")
                         controller = str(msg.get("controller") or "Técnico")
+                        controller_key = str(msg.get("controller_key") or "")
+                        controller_id = str(msg.get("controller_id") or "")
                         if token:
                             threading.Thread(
                                 target=self._accept_internet_session,
-                                args=(token, controller),
+                                args=(token, controller, controller_id, controller_key),
                                 daemon=True,
                             ).start()
 
@@ -240,7 +251,7 @@ class RelayClient:
                 time.sleep(delay)
                 delay = min(15.0, delay * 1.7)
 
-    def _accept_internet_session(self, token, controller):
+    def _accept_internet_session(self, token, controller, controller_id, controller_key):
         sock = None
         try:
             sock = self._open_server_socket(timeout=15)
@@ -248,6 +259,8 @@ class RelayClient:
                 "mode": "host_tunnel",
                 "session": token,
                 "id": self.session_id,
+                "public_key": self.identity.public_key,
+                "device_token": self.identity.device_token,
             })
             reply = recv_control(sock)
             if not reply.get("ok"):
@@ -259,6 +272,10 @@ class RelayClient:
             self.host_service.handle_tunneled_client(
                 sock,
                 f"Internet • {controller}",
+                expected_peer_key=controller_key,
+                verified_controller=controller,
+                verified_controller_id=controller_id,
+                session_token=token,
             )
             sock = None
 
@@ -277,23 +294,31 @@ class RelayClient:
     def open_controller_tunnel(self, target_id, timeout=22):
         if not self.enabled:
             raise RelayError("Servidor de internet não configurado.")
+        if not self.access_token:
+            raise RelayError("Entre como técnico com senha e MFA antes de conectar pela internet.")
 
         sock = self._open_server_socket(timeout=timeout)
         try:
             send_control(sock, {
                 "mode": "request",
                 "target": target_id,
-                "controller": socket.gethostname(),
+                "controller_id": self.session_id,
+                "access_token": self.access_token,
                 "version": self.app_version,
             })
             reply = recv_control(sock)
             if not reply.get("ok"):
-                raise RelayError(reply.get("error") or "Não foi possível abrir a sessão.")
+                error = reply.get("error") or "Não foi possível abrir a sessão."
+                if "expirada" in str(error).lower():
+                    self.logout_technician()
+                raise RelayError(error)
 
             sock.settimeout(None)
             return sock, {
                 "name": reply.get("target_name") or f"PC {target_id}",
                 "transport": "relay",
+                "target_key": str(reply.get("target_key") or ""),
+                "session": str(reply.get("session") or ""),
             }
         except Exception:
             try:
@@ -301,3 +326,66 @@ class RelayClient:
             except Exception:
                 pass
             raise
+
+    def login_technician(self, username, password, otp, timeout=15):
+        if not self.is_ready():
+            raise RelayError("O dispositivo ainda não está autenticado no relay.")
+        sock = self._open_server_socket(timeout=timeout)
+        try:
+            send_control(sock, {
+                "mode": "login",
+                "controller_id": self.session_id,
+                "username": username,
+                "password": password,
+                "otp": otp,
+            })
+            reply = recv_control(sock)
+            if not reply.get("ok"):
+                raise RelayError(reply.get("error") or "Autenticação recusada.")
+            self.access_token = str(reply.get("access_token") or "")
+            self.technician_name = str(reply.get("display_name") or username)
+            return self.technician_name
+        finally:
+            sock.close()
+
+    def logout_technician(self):
+        self.access_token = ""
+        self.technician_name = ""
+
+    def set_enrollment_token(self, token):
+        token = str(token or "").strip()
+        if len(token) < 24:
+            raise RelayError("Código de cadastro inválido.")
+        self.config["enrollment_token"] = token
+        sock = self.control_sock
+        if sock:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+
+    def record_consent(self, session_token, allowed):
+        self.record_event(
+            "consent_allowed" if allowed else "consent_denied", session_token, {}
+        )
+
+    def record_event(self, event, session_token, detail=None):
+        if not self.is_ready() or not self.identity.device_token:
+            return
+        try:
+            sock = self._open_server_socket(timeout=8)
+            try:
+                send_control(sock, {
+                    "mode": "audit",
+                    "id": self.session_id,
+                    "public_key": self.identity.public_key,
+                    "device_token": self.identity.device_token,
+                    "session": str(session_token or ""),
+                    "event": str(event or ""),
+                    "detail": detail if isinstance(detail, dict) else {},
+                })
+                recv_control(sock)
+            finally:
+                sock.close()
+        except Exception:
+            pass

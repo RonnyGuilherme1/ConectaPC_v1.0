@@ -1,183 +1,94 @@
-# ConectaPC 2.0.0 — LAN + Internet Relay
+# ConectaPC 2.1 — suporte remoto autenticado
 
-Esta versão mantém tudo que já existia no ConectaPC 1.2 e adiciona acesso fora
-da rede local.
+Aplicativo Windows para suporte remoto assistido em LAN ou pela internet. A versão 2.1 adiciona a fundação de segurança empresarial: identidade por dispositivo, contas de técnicos com MFA, criptografia ponta a ponta, auditoria, limites contra abuso, atualização assinada e rollback.
 
-## Como a conexão funciona
+## Fluxo de conexão
 
-Ao digitar ID + PIN:
+1. Cada instalação cria uma identidade Ed25519 e um ID permanente.
+2. Para internet, o computador é cadastrado uma única vez no relay.
+3. O técnico entra com usuário, senha e TOTP/MFA.
+4. O ConectaPC tenta localizar o ID na LAN e usa o relay como fallback.
+5. Os dois aplicativos validam suas identidades e negociam chaves X25519.
+6. Tela, comandos, código temporário e arquivos trafegam em frames ChaCha20-Poly1305.
+7. O cliente vê o nome verificado do técnico e a impressão digital do dispositivo antes de permitir.
+8. O código temporário possui seis dígitos, uso único e limite de tentativas.
 
-1. o ConectaPC procura o ID na LAN por aproximadamente 2 segundos;
-2. se encontrar, conecta diretamente PC → PC;
-3. se não encontrar, tenta o servidor ConectaPC;
-4. o servidor localiza o ID online em memória;
-5. o PC remoto abre um túnel de saída para o servidor;
-6. o servidor retransmite os bytes entre os dois PCs;
-7. ID + PIN são conferidos pelo PC remoto;
-8. o usuário remoto ainda precisa clicar em Permitir.
+O relay transporta bytes criptografados e não recebe conteúdo de tela, comandos, código temporário ou arquivos em texto claro.
 
-Nenhuma porta precisa ser aberta no roteador do cliente.
+## Funcionalidades atuais
 
-## Sem banco de dados
+- tela remota, mouse e teclado;
+- múltiplas sessões em abas;
+- envio, recebimento e drag-and-drop de arquivos com tamanho e SHA-256;
+- conexão LAN direta;
+- conexão por relay sem abrir porta no roteador do cliente;
+- consentimento local obrigatório;
+- contas de técnico com MFA;
+- cadastro e revogação de dispositivos;
+- auditoria de sessões e transferências sem conteúdo sensível;
+- atualização por manifesto Ed25519 e rollback do instalador anterior;
+- instalador Inno Setup e pipeline Authenticode.
 
-O servidor mantém apenas em RAM:
+## Configuração mínima
 
-    123456789 -> conexão online
-    987654321 -> conexão online
-
-Ao fechar o ConectaPC, o ID sai da lista.
-Ao reiniciar o servidor, a lista zera.
-
-## Configurar o servidor no Windows
-
-Edite:
-
-    relay_config.json
-
-Exemplo com certificado público:
+Edite `relay_config.json` antes do build:
 
     {
       "enabled": true,
-      "host": "relay.seudominio.com.br",
+      "host": "relay.suaempresa.com.br",
       "port": 443,
       "tls": true,
-      "server_name": "relay.seudominio.com.br",
+      "server_name": "relay.suaempresa.com.br",
       "ca_file": "",
-      "allow_insecure_dev": false
+      "allow_insecure_dev": false,
+      "enrollment_token": "",
+      "updates": {
+        "manifest_url": "https://updates.suaempresa.com.br/update.json",
+        "public_key": "",
+        "allow_insecure_dev": false
+      }
     }
 
-Depois execute:
+TLS e validação de certificado são obrigatórios fora do laboratório. A chave pública de atualização de produção deve ser fixada em `updates.py`; a chave vinda do JSON só funciona no modo de desenvolvimento inseguro.
 
-    EXECUTAR_TESTE.bat
+## Relay e cadastro
 
-Na tela inicial aparecerão dois estados:
+Os arquivos do servidor estão em `server/`. Depois de instalar o serviço, crie técnicos e códigos de cadastro usando:
 
-- LAN
-- Internet
+    python3 server/manage_security.py --db relay.db add-technician suporte --name "Suporte"
+    python3 server/manage_security.py --db relay.db create-enrollment --label "Cliente - PC"
 
-Quando o servidor estiver conectado:
+Instruções completas, revogação, auditoria, assinatura e atualização estão em [SECURITY_PHASE1.md](SECURITY_PHASE1.md). A implantação Ubuntu/TLS está em [server/DEPLOY_VPS.md](server/DEPLOY_VPS.md).
 
-    Internet pronta
+## Desenvolvimento e testes
 
-## Gerar o instalador
+    python -m pip install -r requirements.txt
+    python -m unittest discover -v
+    python app.py
 
-Depois de configurar `relay_config.json`:
+Teste integrado do relay em laboratório:
+
+    python server/relay_server.py --host 127.0.0.1 --port 45443 --allow-plain --db relay-test.db
+    python server/TESTAR_RELAY_LOCAL.py 127.0.0.1 45443 relay-test.db
+
+## Build
 
     GERAR_INSTALADOR.bat
 
-Resultado:
+Resultado esperado:
 
-    dist_installer\ConectaPC_Setup_v2.0.0.exe
+    dist_installer\ConectaPC_Setup_v2.1.0.exe
 
-O arquivo de configuração é incorporado no executável.
+Builds de desenvolvimento podem ficar sem assinatura. Para release, defina `CONECTAPC_RELEASE=1`; o pipeline recusará artefatos sem certificado Authenticode válido.
 
-## Override local de configuração
+## Preparar um piloto
 
-Para testes, o ConectaPC também procura:
+    .\GERAR_PACOTE_RELAY.ps1
+    .\CONFIGURAR_CLIENTE_PRODUCAO.ps1 -RelayHost relay.suaempresa.com.br
+    .\VERIFICAR_PILOTO.ps1
 
-    %LOCALAPPDATA%\ConectaPC\relay_config.json
+O preflight testa configuração segura, DNS, TLS, chave de atualização, certificado Authenticode, testes automatizados, dependências e assinatura do Setup. Ele retorna código 2 enquanto houver qualquer bloqueio obrigatório.
 
-Se esse arquivo existir, ele substitui a configuração empacotada.
+## Limites conhecidos
 
-Isso permite trocar de relay sem recompilar durante desenvolvimento.
-
-## Servidor
-
-A pasta:
-
-    server\
-
-contém:
-
-    relay_server.py
-    DEPLOY_VPS.md
-    GERAR_CERTIFICADO_TESTE.sh
-    systemd\conectapc-relay.service
-
-O servidor usa somente Python 3.11+ e biblioteca padrão.
-
-## TLS
-
-Para internet real use TLS.
-
-Não habilite:
-
-    "tls": false
-
-em computadores de clientes.
-
-O modo sem TLS existe apenas para laboratório privado e precisa de:
-
-    "allow_insecure_dev": true
-
-no cliente e:
-
-    --allow-plain
-
-no servidor.
-
-## O que o relay vê
-
-O servidor não recebe o PIN durante o registro do ID e não mantém banco de dados.
-
-Porém, nesta versão o TLS termina no relay. Portanto o relay tecnicamente pode
-observar o tráfego da sessão enquanto o retransmite.
-
-Para uma versão comercial, a próxima camada de segurança deve ser criptografia
-ponta a ponta entre os dois ConectaPC, por cima do relay.
-
-## Funcionalidades mantidas
-
-- interface PySide6/Qt;
-- ID + PIN temporários;
-- consentimento no PC remoto;
-- tela remota;
-- mouse/teclado;
-- envio/recebimento de arquivos;
-- drag and drop;
-- múltiplas sessões;
-- últimos acessos;
-- tela dedicada da sessão;
-- F11;
-- instalador Inno Setup.
-
-## Sem servidor: é possível?
-
-### LAN
-Sim. Já funciona sem servidor.
-
-### Internet com IP público e redirecionamento de porta
-Tecnicamente sim, mas:
-
-- exige configurar roteador;
-- CGNAT pode impedir completamente;
-- IP pode mudar;
-- é inadequado expor o protocolo atual diretamente.
-
-### VPN de malha
-Tailscale/ZeroTier podem fazer os dois PCs parecerem estar na mesma LAN.
-Você não precisa manter uma VPS própria, mas usa infraestrutura de terceiros.
-
-### P2P/WebRTC
-P2P reduz o uso do relay, mas normalmente ainda precisa de:
-
-- signaling/rendezvous;
-- STUN;
-- TURN/relay quando NAT impede P2P.
-
-Por isso o desenho recomendado para o ConectaPC é:
-
-    LAN direta
-       ↓ se não encontrar
-    Internet P2P (futuro)
-       ↓ se falhar
-    Relay
-
-## Próximas melhorias recomendadas
-
-1. criptografia E2E entre clientes;
-2. P2P/ICE/STUN;
-3. relay apenas como fallback;
-4. H.264/H.265 com aceleração de hardware;
-5. canais separados para vídeo, controle e arquivos;
-6. métricas de latência/bitrate.
+A versão 2.1 ainda é de acesso assistido. Ela não controla tela de login/UAC, não inicia como serviço Windows, não possui múltiplos monitores, clipboard, áudio, codec de vídeo por hardware, P2P/ICE ou reinício com reconexão. Esses itens continuam nas fases posteriores.

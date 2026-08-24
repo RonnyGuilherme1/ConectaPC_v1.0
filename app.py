@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
-import random
+import secrets
+import shutil
 import socket
 import struct
 import sys
@@ -17,23 +19,31 @@ from PIL import Image
 from PySide6.QtCore import QObject, Qt, Signal, QEvent
 from PySide6.QtGui import QIcon, QImage, QKeyEvent, QKeySequence, QMouseEvent, QPixmap, QShortcut, QWheelEvent
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QFrame, QGraphicsDropShadowEffect, QHBoxLayout,
-    QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+    QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGraphicsDropShadowEffect, QHBoxLayout,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QInputDialog,
     QSizePolicy, QSpacerItem, QStackedWidget, QTabBar, QTabWidget, QVBoxLayout, QWidget
 )
 
 from protocol import recv_frame, recv_json_payload, send_frame, send_json
 from internet import RelayClient, RelayError
+from security import (
+    fingerprint, load_known_peers, load_or_create_identity,
+    open_secure_controller, open_secure_host,
+)
 from theme import APP_QSS
+from updates import (
+    apply_rollback, apply_update, check_and_download, rollback_available,
+)
 
 APP_NAME = "ConectaPC"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 TCP_PORT = 45888
 DISCOVERY_PORT = 45889
 SERVICE = "CONECTAPC_LAN_V1"
 FPS = 14
 JPEG_QUALITY = 48
 MAX_WIDTH = 1280
+MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024
 VIDEO_SEND_TIMEOUT = 1.5
 MOUSE_MOVE_INTERVAL = 0.018
 
@@ -48,11 +58,11 @@ def resource_path(relative):
 
 
 def random_id():
-    return f"{random.randint(100_000_000, 999_999_999):09d}"
+    return f"{secrets.randbelow(900_000_000) + 100_000_000:09d}"
 
 
 def random_pin():
-    return f"{random.randint(0, 9999):04d}"
+    return f"{secrets.randbelow(1_000_000):06d}"
 
 
 def local_ip():
@@ -78,6 +88,31 @@ def unique_path(path: Path):
         if not p.exists():
             return p
         i += 1
+
+
+def file_sha256(path: Path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def prepare_incoming_file(name, declared_size):
+    name = os.path.basename(str(name or "arquivo.bin")) or "arquivo.bin"
+    size = int(declared_size)
+    if size < 0 or size > MAX_FILE_SIZE:
+        raise ValueError("Tamanho de arquivo não permitido")
+    folder = Path.home() / "Downloads" / "ConectaPC Recebidos"
+    folder.mkdir(parents=True, exist_ok=True)
+    if shutil.disk_usage(folder).free < size + 32 * 1024 * 1024:
+        raise OSError("Espaço em disco insuficiente para receber o arquivo")
+    final_path = unique_path(folder / name)
+    temp_path = final_path.with_name(final_path.name + f".{secrets.token_hex(6)}.part")
+    return name, size, final_path, temp_path
 
 
 def pretty_id(value):
@@ -172,6 +207,9 @@ class UiBridge(QObject):
     ask_accept = Signal(str, str, object)
     ask_file = Signal(object)
     notify = Signal(str, str)
+    pin_changed = Signal(str)
+    update_ready = Signal(str, str)
+    update_status = Signal(str)
 
 
 class DiscoveryService:
@@ -254,13 +292,21 @@ class DiscoveryService:
 
 
 class HostService:
-    def __init__(self, session_id, pin, bridge):
+    def __init__(self, session_id, pin, identity, known_peers, bridge):
         self.session_id = session_id
         self.pin = pin
+        self.identity = identity
+        self.known_peers = known_peers
         self.bridge = bridge
         self.stop_event = threading.Event()
         self.connections = set()
         self.lock = threading.Lock()
+        self.pin_lock = threading.Lock()
+        self.attempts = {}
+        self.connection_slots = threading.BoundedSemaphore(32)
+        self.file_send_lock = threading.Lock()
+        self.audit_callback = None
+        self.event_callback = None
 
     def start(self):
         threading.Thread(target=self._server_loop, daemon=True).start()
@@ -308,13 +354,42 @@ class HostService:
         except Exception:
             pass
 
-    def handle_tunneled_client(self, conn, origin_label="Internet"):
+    def handle_tunneled_client(
+        self, conn, origin_label="Internet", expected_peer_key=None,
+        verified_controller=None, verified_controller_id="", session_token="",
+    ):
         """Recebe uma conexão já transportada pelo relay.
 
-        A autenticação ID/PIN e o consentimento continuam ocorrendo dentro do
+        A autenticação E2E/código temporário e o consentimento ocorrem dentro do
         protocolo normal; o relay apenas transporta os bytes.
         """
-        self._handle_client(conn, (origin_label, 0))
+        self._handle_client(
+            conn, (origin_label, 0), expected_peer_key=expected_peer_key,
+            verified_controller=verified_controller,
+            verified_controller_id=verified_controller_id,
+            session_token=session_token,
+        )
+
+    def _consume_pin(self, candidate, peer_key, source):
+        now = time.monotonic()
+        with self.pin_lock:
+            keys = [("peer", peer_key), ("source", str(source))]
+            histories = {}
+            for key in keys:
+                history = [stamp for stamp in self.attempts.get(key, []) if stamp > now - 300]
+                histories[key] = history
+                self.attempts[key] = history
+                if len(history) >= 5:
+                    return False, "Muitas tentativas. Aguarde cinco minutos."
+            if not secrets.compare_digest(str(candidate or ""), self.pin):
+                for key in keys:
+                    histories[key].append(now)
+                    self.attempts[key] = histories[key]
+                return False, "ID ou código temporário incorreto."
+            self.attempts.pop(("peer", peer_key), None)
+            self.pin = random_pin()
+            self.bridge.pin_changed.emit(self.pin)
+            return True, ""
 
     def _ask_accept(self, controller, ip):
         response = {"event": threading.Event(), "ok": False}
@@ -328,10 +403,22 @@ class HostService:
         response["event"].wait(120)
         return response["path"]
 
-    def _handle_client(self, conn, addr):
+    def _handle_client(
+        self, conn, addr, expected_peer_key=None,
+        verified_controller=None, verified_controller_id="", session_token="",
+    ):
+        is_relay_session = bool(session_token)
+        session_token = session_token or ("lan-" + secrets.token_urlsafe(24))
+        accepted = False
+        if not self.connection_slots.acquire(blocking=False):
+            conn.close()
+            return
         send_lock = threading.Lock()
         stop_conn = threading.Event()
         try:
+            conn.settimeout(15)
+            conn = open_secure_host(conn, self.identity, expected_peer_key)
+            conn.settimeout(None)
             kind, payload = recv_frame(conn)
             if kind != b"J":
                 return
@@ -339,13 +426,46 @@ class HostService:
             if hello.get("type") != "hello":
                 return
 
-            if hello.get("id") != self.session_id or hello.get("pin") != self.pin:
-                send_json(conn, {"type": "hello_error", "message": "ID ou PIN incorreto."}, send_lock)
+            controller_id = str(verified_controller_id or hello.get("controller_id") or "")
+            known_id = "controller:" + controller_id if controller_id else "controller-key:" + conn.peer_fingerprint
+            if not self.known_peers.matches(known_id, conn.peer_public_key):
+                send_json(conn, {
+                    "type": "hello_error",
+                    "message": "A identidade conhecida deste técnico mudou. A conexão foi bloqueada.",
+                }, send_lock)
                 return
 
-            if not self._ask_accept(hello.get("controller") or "Técnico", addr[0]):
+            pin_ok, pin_error = self._consume_pin(
+                hello.get("pin"), conn.peer_public_key, addr[0]
+            )
+            if hello.get("id") != self.session_id or not pin_ok:
+                send_json(conn, {"type": "hello_error", "message": pin_error or "ID incorreto."}, send_lock)
+                return
+
+            if verified_controller:
+                controller_label = f"{verified_controller} (identidade verificada)\nDispositivo {conn.peer_fingerprint}"
+            else:
+                controller_label = (
+                    f"{hello.get('controller') or 'Técnico'} (LAN, identidade não cadastrada)\n"
+                    f"Dispositivo {conn.peer_fingerprint}"
+                )
+            accepted = self._ask_accept(controller_label, addr[0])
+            if self.audit_callback:
+                threading.Thread(
+                    target=self.audit_callback, args=(session_token, accepted), daemon=True
+                ).start()
+            if not accepted:
                 send_json(conn, {"type": "hello_error", "message": "Conexão recusada pelo usuário."}, send_lock)
                 return
+            self.known_peers.remember(
+                known_id, conn.peer_public_key,
+                verified_controller or hello.get("controller") or "Técnico",
+            )
+            if not is_relay_session and self.event_callback:
+                threading.Thread(
+                    target=self.event_callback,
+                    args=("lan_session_started", session_token, {}), daemon=True,
+                ).start()
 
             with self.lock:
                 self.connections.add(conn)
@@ -366,7 +486,7 @@ class HostService:
                 daemon=True,
             ).start()
 
-            self._command_loop(conn, send_lock, stop_conn)
+            self._command_loop(conn, send_lock, stop_conn, session_token)
 
         except Exception:
             pass
@@ -380,6 +500,12 @@ class HostService:
                 self.connections.discard(conn)
                 count = len(self.connections)
             self.bridge.host_connections.emit(count)
+            if accepted and not is_relay_session and self.event_callback:
+                threading.Thread(
+                    target=self.event_callback,
+                    args=("lan_session_ended", session_token, {}), daemon=True,
+                ).start()
+            self.connection_slots.release()
 
     def _screen_sender(self, conn, send_lock, stop_conn):
         """Streaming LAN adaptativo.
@@ -449,7 +575,7 @@ class HostService:
         except Exception:
             stop_conn.set()
 
-    def _command_loop(self, conn, send_lock, stop_conn):
+    def _command_loop(self, conn, send_lock, stop_conn, session_token=""):
         upload = None
         upload_fh = None
         try:
@@ -478,23 +604,42 @@ class HostService:
                             pyautogui.keyUp(key)
 
                     elif t == "file_start":
-                        name = os.path.basename(msg.get("name", "arquivo.bin"))
-                        folder = Path.home() / "Downloads" / "ConectaPC Recebidos"
-                        folder.mkdir(parents=True, exist_ok=True)
-                        target = unique_path(folder / name)
-                        upload = {"path": target, "name": name}
-                        upload_fh = open(target, "wb")
+                        if upload_fh:
+                            raise ValueError("Já existe uma transferência em andamento")
+                        name, size, target, temp = prepare_incoming_file(msg.get("name"), msg.get("size", -1))
+                        expected_hash = str(msg.get("sha256") or "").lower()
+                        if len(expected_hash) != 64 or any(c not in "0123456789abcdef" for c in expected_hash):
+                            raise ValueError("Hash do arquivo inválido")
+                        upload = {
+                            "path": target, "temp": temp, "name": name, "size": size,
+                            "received": 0, "sha256": expected_hash, "hasher": hashlib.sha256(),
+                        }
+                        upload_fh = open(temp, "xb")
 
                     elif t == "file_end":
                         if upload_fh:
                             upload_fh.close()
                             upload_fh = None
                         if upload:
+                            if upload["received"] != upload["size"] or upload["hasher"].hexdigest() != upload["sha256"]:
+                                upload["temp"].unlink(missing_ok=True)
+                                raise ValueError("Arquivo recebido incompleto ou com hash divergente")
+                            os.replace(upload["temp"], upload["path"])
                             self.bridge.notify.emit(
                                 "Arquivo recebido",
                                 f"O arquivo foi salvo em:\n{upload['path']}",
                             )
-                            send_json(conn, {"type": "file_received", "name": upload["name"]}, send_lock)
+                            send_json(conn, {
+                                "type": "file_received", "name": upload["name"],
+                                "size": upload["size"], "sha256": upload["sha256"],
+                            }, send_lock)
+                            if self.event_callback and session_token:
+                                threading.Thread(
+                                    target=self.event_callback,
+                                    args=("file_received", session_token, {
+                                        "direction": "controller_to_host", "size": upload["size"],
+                                    }), daemon=True,
+                                ).start()
                             upload = None
 
                     elif t == "request_file":
@@ -502,7 +647,7 @@ class HostService:
                         if path:
                             threading.Thread(
                                 target=self._send_file,
-                                args=(conn, send_lock, path),
+                                args=(conn, send_lock, path, session_token),
                                 daemon=True,
                             ).start()
                         else:
@@ -512,7 +657,11 @@ class HostService:
                         break
 
                 elif kind == b"U" and upload_fh:
+                    if upload["received"] + len(payload) > upload["size"]:
+                        raise ValueError("Arquivo excedeu o tamanho declarado")
                     upload_fh.write(payload)
+                    upload["received"] += len(payload)
+                    upload["hasher"].update(payload)
 
         finally:
             if upload_fh:
@@ -520,20 +669,33 @@ class HostService:
                     upload_fh.close()
                 except Exception:
                     pass
+            if upload and upload.get("temp"):
+                upload["temp"].unlink(missing_ok=True)
             stop_conn.set()
 
-    def _send_file(self, conn, send_lock, path):
+    def _send_file(self, conn, send_lock, path, session_token=""):
         try:
-            p = Path(path)
-            size = p.stat().st_size
-            send_json(conn, {"type": "download_start", "name": p.name, "size": size}, send_lock)
-            with p.open("rb") as fh:
-                while True:
-                    chunk = fh.read(256 * 1024)
-                    if not chunk:
-                        break
-                    send_frame(conn, b"D", chunk, send_lock)
-            send_json(conn, {"type": "download_end", "name": p.name}, send_lock)
+            with self.file_send_lock:
+                p = Path(path)
+                size = p.stat().st_size
+                if size > MAX_FILE_SIZE:
+                    raise ValueError("Arquivo excede o limite de 10 GB")
+                digest = file_sha256(p)
+                send_json(conn, {
+                    "type": "download_start", "name": p.name, "size": size, "sha256": digest,
+                }, send_lock)
+                with p.open("rb") as fh:
+                    while True:
+                        chunk = fh.read(256 * 1024)
+                        if not chunk:
+                            break
+                        send_frame(conn, b"D", chunk, send_lock)
+                send_json(conn, {"type": "download_end", "name": p.name, "sha256": digest}, send_lock)
+                if self.event_callback and session_token:
+                    self.event_callback(
+                        "file_sent", session_token,
+                        {"direction": "host_to_controller", "size": size},
+                    )
         except Exception as e:
             self.bridge.notify.emit("Falha no envio", str(e))
 
@@ -686,11 +848,19 @@ class RemoteSession(QWidget):
     titleChanged = Signal(str)
     closed = Signal(object)
 
-    def __init__(self, peer, sid, pin, parent=None):
+    def __init__(
+        self, peer, sid, pin, identity, controller_name="", event_callback=None,
+        peer_key_callback=None, parent=None
+    ):
         super().__init__(parent)
         self.peer = peer
         self.sid = sid
         self.pin = pin
+        self.identity = identity
+        self.controller_name = controller_name or socket.gethostname()
+        self.event_callback = event_callback
+        self.relay_session = str(peer.get("relay_session") or "")
+        self.peer_key_callback = peer_key_callback
 
         self.sock = None
         self.connected_flag = False
@@ -701,6 +871,8 @@ class RemoteSession(QWidget):
         self.last_mouse_send = 0
         self.download_fh = None
         self.download_path = None
+        self.download = None
+        self.transfer_lock = threading.Lock()
 
         self.bridge = SessionBridge()
         self.bridge.connected.connect(self._on_connected)
@@ -803,12 +975,14 @@ class RemoteSession(QWidget):
             except OSError:
                 pass
             sock.settimeout(None)
+            sock = open_secure_controller(sock, self.identity, self.peer.get("expected_peer_key"))
             self.sock = sock
             send_json(sock, {
                 "type":"hello",
                 "id":self.sid,
                 "pin":self.pin,
-                "controller":socket.gethostname(),
+                "controller":self.controller_name,
+                "controller_id":self.identity.device_id,
             }, self.send_lock)
 
             kind, payload = recv_frame(sock)
@@ -821,6 +995,8 @@ class RemoteSession(QWidget):
             self.remote_w = int(msg.get("screen_width",1))
             self.remote_h = int(msg.get("screen_height",1))
             self.connected_flag = True
+            if self.peer_key_callback:
+                self.peer_key_callback(self.sid, sock.peer_public_key, msg.get("host") or self.peer["name"])
             self.bridge.connected.emit(msg.get("host") or self.peer["name"], self.peer["ip"])
             self._reader_loop(sock)
 
@@ -844,20 +1020,42 @@ class RemoteSession(QWidget):
                     t = msg.get("type")
 
                     if t == "download_start":
-                        folder = Path.home() / "Downloads" / "ConectaPC Recebidos"
-                        folder.mkdir(parents=True, exist_ok=True)
-                        target = unique_path(folder / os.path.basename(msg.get("name","arquivo.bin")))
+                        if self.download_fh:
+                            raise ValueError("Já existe um recebimento em andamento")
+                        name, size, target, temp = prepare_incoming_file(msg.get("name"), msg.get("size", -1))
+                        expected_hash = str(msg.get("sha256") or "").lower()
+                        if len(expected_hash) != 64 or any(c not in "0123456789abcdef" for c in expected_hash):
+                            raise ValueError("Hash do arquivo inválido")
                         self.download_path = target
-                        self.download_fh = open(target, "wb")
+                        self.download = {
+                            "temp": temp, "size": size, "received": 0,
+                            "sha256": expected_hash, "hasher": hashlib.sha256(),
+                        }
+                        self.download_fh = open(temp, "xb")
                         self.bridge.status.emit(f"Recebendo {target.name}…")
 
                     elif t == "download_end":
                         if self.download_fh:
                             self.download_fh.close()
                             self.download_fh = None
-                        if self.download_path:
+                        if self.download_path and self.download:
+                            if (
+                                self.download["received"] != self.download["size"]
+                                or self.download["hasher"].hexdigest() != self.download["sha256"]
+                            ):
+                                self.download["temp"].unlink(missing_ok=True)
+                                raise ValueError("Arquivo recebido incompleto ou com hash divergente")
+                            os.replace(self.download["temp"], self.download_path)
                             self.bridge.notify.emit("Arquivo recebido", f"Salvo em:\n{self.download_path}")
+                            if self.event_callback and self.relay_session:
+                                threading.Thread(
+                                    target=self.event_callback,
+                                    args=("file_received", self.relay_session, {
+                                        "direction": "host_to_controller", "size": self.download["size"],
+                                    }), daemon=True,
+                                ).start()
                             self.download_path = None
+                            self.download = None
 
                     elif t == "file_received":
                         self.bridge.status.emit(f"Arquivo enviado: {msg.get('name','')}")
@@ -869,7 +1067,11 @@ class RemoteSession(QWidget):
                         self.bridge.status.emit(msg.get("message","Erro remoto."))
 
                 elif kind == b"D" and self.download_fh:
+                    if self.download["received"] + len(payload) > self.download["size"]:
+                        raise ValueError("Arquivo excedeu o tamanho declarado")
                     self.download_fh.write(payload)
+                    self.download["received"] += len(payload)
+                    self.download["hasher"].update(payload)
 
         except Exception as e:
             if self.connected_flag:
@@ -882,6 +1084,9 @@ class RemoteSession(QWidget):
                 except Exception:
                     pass
                 self.download_fh = None
+            if self.download and self.download.get("temp"):
+                self.download["temp"].unlink(missing_ok=True)
+            self.download = None
             try:
                 sock.close()
             except Exception:
@@ -974,24 +1179,37 @@ class RemoteSession(QWidget):
 
     def _send_files_thread(self, files):
         try:
-            total = len(files)
-            for idx, path in enumerate(files, 1):
-                p = Path(path)
-                size = p.stat().st_size
-                self.bridge.status.emit(f"Enviando {p.name} ({idx}/{total})…")
-                self.bridge.progress.emit(0)
-                send_json(self.sock, {"type":"file_start","name":p.name,"size":size}, self.send_lock)
-                sent = 0
-                with p.open("rb") as fh:
-                    while True:
-                        chunk = fh.read(256*1024)
-                        if not chunk:
-                            break
-                        send_frame(self.sock, b"U", chunk, self.send_lock)
-                        sent += len(chunk)
-                        pct = 100 if size == 0 else int(sent*100/size)
-                        self.bridge.progress.emit(pct)
-                send_json(self.sock, {"type":"file_end","name":p.name}, self.send_lock)
+            with self.transfer_lock:
+                total = len(files)
+                for idx, path in enumerate(files, 1):
+                    p = Path(path)
+                    size = p.stat().st_size
+                    if size > MAX_FILE_SIZE:
+                        raise ValueError(f"{p.name} excede o limite de 10 GB")
+                    digest = file_sha256(p)
+                    self.bridge.status.emit(f"Enviando {p.name} ({idx}/{total})…")
+                    self.bridge.progress.emit(0)
+                    send_json(self.sock, {
+                        "type":"file_start", "name":p.name, "size":size, "sha256":digest,
+                    }, self.send_lock)
+                    sent = 0
+                    with p.open("rb") as fh:
+                        while True:
+                            chunk = fh.read(256*1024)
+                            if not chunk:
+                                break
+                            send_frame(self.sock, b"U", chunk, self.send_lock)
+                            sent += len(chunk)
+                            pct = 100 if size == 0 else int(sent*100/size)
+                            self.bridge.progress.emit(pct)
+                    send_json(self.sock, {
+                        "type":"file_end", "name":p.name, "sha256":digest,
+                    }, self.send_lock)
+                    if self.event_callback and self.relay_session:
+                        self.event_callback(
+                            "file_sent", self.relay_session,
+                            {"direction": "controller_to_host", "size": size},
+                        )
             self.bridge.status.emit(f"{total} arquivo(s) enviado(s).")
             self.bridge.progress.emit(100)
             time.sleep(.5)
@@ -1046,7 +1264,9 @@ class MainWindow(QMainWindow):
         self.resize(1180, 780)
         self.setMinimumSize(980, 680)
 
-        self.session_id = random_id()
+        self.identity = load_or_create_identity(app_data_dir())
+        self.known_peers = load_known_peers(app_data_dir())
+        self.session_id = self.identity.device_id
         self.pin = random_pin()
         self.ip = local_ip()
         self.recents = load_recents()
@@ -1058,16 +1278,24 @@ class MainWindow(QMainWindow):
         self.bridge.ask_accept.connect(self._ask_accept_ui)
         self.bridge.ask_file.connect(self._ask_file_ui)
         self.bridge.notify.connect(lambda t,m: QMessageBox.information(self,t,m))
+        self.bridge.pin_changed.connect(self._set_new_pin)
+        self.bridge.update_ready.connect(self._offer_update)
+        self.bridge.update_status.connect(self._set_update_status)
 
         self.discovery = DiscoveryService(self.session_id)
-        self.host = HostService(self.session_id, self.pin, self.bridge)
+        self.host = HostService(
+            self.session_id, self.pin, self.identity, self.known_peers, self.bridge
+        )
         self.relay = RelayClient(
             self.session_id,
+            self.identity,
             self.host,
             self.bridge,
             resource_path("relay_config.json"),
             APP_VERSION,
         )
+        self.host.audit_callback = self.relay.record_consent
+        self.host.event_callback = self.relay.record_event
 
         self._build_ui()
         self.discovery.start()
@@ -1175,7 +1403,7 @@ class MainWindow(QMainWindow):
         sep.setStyleSheet("background:#DCEFE1;")
         ll.addWidget(sep)
 
-        lbl_pin = QLabel("PIN")
+        lbl_pin = QLabel("Código temporário")
         lbl_pin.setObjectName("Muted")
         ll.addWidget(lbl_pin)
 
@@ -1185,7 +1413,7 @@ class MainWindow(QMainWindow):
         pinrow.addWidget(self.pin_value, 1)
         copy_pin = QPushButton("⧉")
         copy_pin.setObjectName("CopyButton")
-        copy_pin.setToolTip("Copiar PIN")
+        copy_pin.setToolTip("Copiar código temporário")
         copy_pin.clicked.connect(lambda: QApplication.clipboard().setText(self.pin))
         pinrow.addWidget(copy_pin)
         ll.addLayout(pinrow)
@@ -1211,7 +1439,7 @@ class MainWindow(QMainWindow):
         labels = QHBoxLayout()
         lid = QLabel("ID")
         lid.setObjectName("Muted")
-        lpin = QLabel("PIN")
+        lpin = QLabel("Código")
         lpin.setObjectName("Muted")
         labels.addWidget(lid, 3)
         labels.addWidget(lpin, 1)
@@ -1224,8 +1452,8 @@ class MainWindow(QMainWindow):
         fields.addWidget(self.remote_id, 3)
 
         self.remote_pin = QLineEdit()
-        self.remote_pin.setPlaceholderText("PIN")
-        self.remote_pin.setMaxLength(4)
+        self.remote_pin.setPlaceholderText("6 dígitos")
+        self.remote_pin.setMaxLength(6)
         self.remote_pin.setEchoMode(QLineEdit.Password)
         self.remote_pin.returnPressed.connect(self.connect_remote)
         fields.addWidget(self.remote_pin, 1)
@@ -1236,9 +1464,19 @@ class MainWindow(QMainWindow):
         self.connect_btn.clicked.connect(self.connect_remote)
         rl.addWidget(self.connect_btn)
 
+        self.login_btn = QPushButton("Entrar como técnico")
+        self.login_btn.setEnabled(self.relay.is_ready())
+        self.login_btn.clicked.connect(self._login_technician_ui)
+        rl.addWidget(self.login_btn)
+
+        self.enroll_btn = QPushButton("Cadastrar este computador")
+        self.enroll_btn.setVisible(self.relay.enabled and not self.identity.device_token)
+        self.enroll_btn.clicked.connect(self._enroll_device_ui)
+        rl.addWidget(self.enroll_btn)
+
         info = QLabel(
             "O ConectaPC tenta primeiro a rede local. Se o ID não estiver na LAN, "
-            "usa automaticamente o servidor relay pela internet. O PIN nunca é salvo."
+            "usa automaticamente o relay. O código é criptografado ponta a ponta, não é salvo e muda após o uso."
         )
         info.setWordWrap(True)
         info.setObjectName("Muted")
@@ -1298,13 +1536,22 @@ class MainWindow(QMainWindow):
         footer.setObjectName("Footer")
         fl = QHBoxLayout(footer)
         fl.setContentsMargins(26,10,26,10)
-        left = QLabel("Seguro  •  Rápido  •  Confiável")
+        left = QLabel("Criptografia E2E  •  Consentimento  •  MFA no relay")
         left.setObjectName("Muted")
         fl.addWidget(left)
         fl.addStretch(1)
         ver = QLabel(f"{APP_NAME} {APP_VERSION}")
         ver.setObjectName("Muted")
         fl.addWidget(ver)
+
+        self.update_btn = QPushButton("Verificar atualizações")
+        self.update_btn.clicked.connect(self._check_updates)
+        fl.addWidget(self.update_btn)
+
+        self.rollback_btn = QPushButton("Restaurar versão anterior")
+        self.rollback_btn.setVisible(rollback_available(app_data_dir()))
+        self.rollback_btn.clicked.connect(self._apply_rollback)
+        fl.addWidget(self.rollback_btn)
         outer.addWidget(footer)
 
         return root
@@ -1492,6 +1739,10 @@ class MainWindow(QMainWindow):
         )
         self.internet_badge.style().unpolish(self.internet_badge)
         self.internet_badge.style().polish(self.internet_badge)
+        if hasattr(self, "enroll_btn"):
+            self.enroll_btn.setVisible(self.relay.enabled and not self.identity.device_token)
+        if hasattr(self, "login_btn"):
+            self.login_btn.setEnabled(bool(online))
 
     def _set_incoming_count(self, n):
         if n == 0:
@@ -1500,6 +1751,100 @@ class MainWindow(QMainWindow):
             self.incoming_label.setText("1 sessão recebida")
         else:
             self.incoming_label.setText(f"{n} sessões recebidas")
+
+    def _set_new_pin(self, pin):
+        self.pin = pin
+        self.pin_value.setText(pin)
+
+    def _set_update_status(self, text):
+        self.update_btn.setText(text)
+        self.update_btn.setEnabled(text == "Verificar atualizações")
+
+    def _check_updates(self):
+        self.update_btn.setEnabled(False)
+        self.update_btn.setText("Verificando…")
+        threading.Thread(target=self._check_updates_thread, daemon=True).start()
+
+    def _check_updates_thread(self):
+        try:
+            path, manifest = check_and_download(
+                self.relay.config.get("updates") or {}, APP_VERSION, app_data_dir()
+            )
+            if path is None:
+                self.bridge.notify.emit("Atualizações", "O ConectaPC já está atualizado.")
+            else:
+                self.bridge.update_ready.emit(str(path), str(manifest["version"]))
+        except Exception as exc:
+            self.bridge.notify.emit("Atualizações", str(exc))
+        finally:
+            self.bridge.update_status.emit("Verificar atualizações")
+
+    def _offer_update(self, path, version):
+        answer = QMessageBox.question(
+            self, "Atualização verificada",
+            f"A versão {version} foi baixada e teve assinatura e SHA-256 validados.\n\nInstalar agora?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes:
+            apply_update(path, app_data_dir())
+            QApplication.quit()
+
+    def _apply_rollback(self):
+        answer = QMessageBox.question(
+            self, "Restaurar versão anterior",
+            "Deseja executar o instalador da versão anterior verificada?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes:
+            try:
+                apply_rollback(app_data_dir())
+                QApplication.quit()
+            except Exception as exc:
+                QMessageBox.critical(self, "Restauração", str(exc))
+
+    def _login_technician_ui(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Identificação do técnico")
+        form = QFormLayout(dialog)
+        username = QLineEdit()
+        password = QLineEdit()
+        password.setEchoMode(QLineEdit.Password)
+        otp = QLineEdit()
+        otp.setMaxLength(6)
+        otp.setPlaceholderText("Código de 6 dígitos do autenticador")
+        form.addRow("Usuário", username)
+        form.addRow("Senha", password)
+        form.addRow("MFA", otp)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            return False
+
+    def _enroll_device_ui(self):
+        token, ok = QInputDialog.getText(
+            self, "Cadastrar computador",
+            "Informe o código de cadastro de uso único gerado no servidor:",
+            QLineEdit.Password,
+        )
+        if not ok:
+            return
+        try:
+            self.relay.set_enrollment_token(token)
+            QMessageBox.information(
+                self, "Cadastro",
+                "Código recebido. O cadastro será concluído automaticamente pelo relay.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Cadastro", str(exc))
+        try:
+            name = self.relay.login_technician(username.text(), password.text(), otp.text())
+            self.login_btn.setText(f"Técnico: {name}")
+            return True
+        except Exception as exc:
+            QMessageBox.critical(self, "Autenticação", str(exc))
+            return False
 
     def _ask_accept_ui(self, controller, ip, response):
         box = QMessageBox(self)
@@ -1529,13 +1874,17 @@ class MainWindow(QMainWindow):
         sid = "".join(c for c in self.remote_id.text() if c.isdigit())
         pin = "".join(c for c in self.remote_pin.text() if c.isdigit())
 
-        if len(sid) != 9 or len(pin) != 4:
+        if len(sid) != 9 or len(pin) != 6:
             QMessageBox.warning(
                 self,
                 APP_NAME,
-                "Informe um ID de 9 dígitos e um PIN de 4 dígitos.",
+                "Informe um ID de 9 dígitos e um código temporário de 6 dígitos.",
             )
             return
+
+        if self.relay.is_ready() and not self.relay.access_token:
+            if not self._login_technician_ui():
+                return
 
         if sid == self.session_id:
             QMessageBox.warning(self, APP_NAME, "Esse é o ID deste próprio computador.")
@@ -1561,6 +1910,7 @@ class MainWindow(QMainWindow):
             time.sleep(.20)
 
         if peer:
+            peer["expected_peer_key"] = self.known_peers.expected("target:" + sid)
             QApplication.instance().postEvent(
                 self,
                 _OpenSessionEvent(peer, sid, pin),
@@ -1570,12 +1920,19 @@ class MainWindow(QMainWindow):
         # 2) Fora da LAN: abre um túnel pelo relay.
         try:
             tunnel, meta = self.relay.open_controller_tunnel(sid)
+            known_key = self.known_peers.expected("target:" + sid)
+            target_key = meta.get("target_key") or ""
+            if known_key and not secrets.compare_digest(known_key, target_key):
+                tunnel.close()
+                raise RelayError("A identidade conhecida do computador remoto mudou. Conexão bloqueada.")
             relay_peer = {
                 "name": meta.get("name") or f"PC {sid}",
                 "ip": "Internet via relay",
                 "port": 0,
                 "mode": "relay",
                 "_preconnected_socket": tunnel,
+                "expected_peer_key": meta.get("target_key") or None,
+                "relay_session": meta.get("session") or "",
             }
             QApplication.instance().postEvent(
                 self,
@@ -1603,7 +1960,12 @@ class MainWindow(QMainWindow):
                 )
                 return
 
-            session = RemoteSession(event.peer, event.sid, event.pin)
+            session = RemoteSession(
+                event.peer, event.sid, event.pin, self.identity,
+                self.relay.technician_name or socket.gethostname(),
+                self.relay.record_event,
+                self._remember_peer,
+            )
             idx = self.tabs.addTab(session, event.peer["name"])
             self.tabs.setCurrentIndex(idx)
 
@@ -1621,6 +1983,9 @@ class MainWindow(QMainWindow):
             return
 
         super().customEvent(event)
+
+    def _remember_peer(self, sid, public_key, label):
+        self.known_peers.remember("target:" + sid, public_key, label)
 
     def _session_connected(self, session, sid, title):
         idx = self.tabs.indexOf(session)
@@ -1661,7 +2026,15 @@ def main():
     app.setWindowIcon(QIcon(resource_path("assets/conectapc.ico")))
     app.setStyleSheet(APP_QSS)
 
-    window = MainWindow()
+    try:
+        window = MainWindow()
+    except Exception as exc:
+        QMessageBox.critical(
+            None, "Falha de segurança do ConectaPC",
+            "Não foi possível carregar a identidade protegida deste computador.\n\n"
+            f"Detalhe: {exc}",
+        )
+        return 1
     window.show()
     sys.exit(app.exec())
 

@@ -1,5 +1,6 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
+. "$PSScriptRoot\ASSINATURA.ps1"
 
 function Find-InnoSetupCompiler {
     $candidates = @(
@@ -43,6 +44,8 @@ if (-not (Test-Path "dist\ConectaPC\ConectaPC.exe")) {
     throw "dist\ConectaPC\ConectaPC.exe nao existe. Execute GERAR_INSTALADOR.bat primeiro."
 }
 
+Sign-ConectaPCArtifact (Join-Path $PSScriptRoot "dist\ConectaPC\ConectaPC.exe")
+
 $iscc = Find-InnoSetupCompiler
 if (-not $iscc) {
     throw "Inno Setup 6/ISCC.exe nao foi encontrado neste computador."
@@ -60,10 +63,12 @@ if ($LASTEXITCODE -ne 0) {
     throw "Falha ao compilar o instalador."
 }
 
-$setup = Join-Path $PSScriptRoot "dist_installer\ConectaPC_Setup_v2.0.0.exe"
+$setup = Join-Path $PSScriptRoot "dist_installer\ConectaPC_Setup_v2.1.0.exe"
 if (-not (Test-Path $setup)) {
     throw "O instalador nao foi criado."
 }
+
+Sign-ConectaPCArtifact $setup
 
 Write-Host ""
 Write-Host "Instalador criado:" -ForegroundColor Green

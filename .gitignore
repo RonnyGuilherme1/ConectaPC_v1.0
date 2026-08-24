@@ -1,0 +1,16 @@
+.buildenv/
+__pycache__/
+*.py[cod]
+*.db
+*.db-wal
+*.db-shm
+*.pfx
+*.pem
+relay.crt
+relay.key
+.env
+build/
+dist/
+dist_installer/
+dist_installer.zip
+dist_relay/
