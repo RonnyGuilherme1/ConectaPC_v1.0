@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import ctypes
 import hashlib
 import json
 import os
@@ -15,8 +16,8 @@ from pathlib import Path
 
 import mss
 import pyautogui
-from PIL import Image
-from PySide6.QtCore import QObject, Qt, Signal, QEvent
+from PIL import Image, ImageEnhance, ImageFilter
+from PySide6.QtCore import QObject, Qt, Signal, QEvent, QTimer
 from PySide6.QtGui import QIcon, QImage, QKeyEvent, QKeySequence, QMouseEvent, QPixmap, QShortcut, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGraphicsDropShadowEffect, QGridLayout, QHBoxLayout,
@@ -133,6 +134,7 @@ def app_data_dir():
 
 
 RECENTS_FILE = app_data_dir() / "recent.json"
+RECENT_PREVIEWS_DIR = app_data_dir() / "recent-previews"
 
 
 def load_recents():
@@ -170,6 +172,63 @@ def save_recents(items):
         pass
 
 
+def recent_preview_path(sid):
+    digits = "".join(c for c in str(sid) if c.isdigit())
+    if len(digits) != 9:
+        return None
+    return RECENT_PREVIEWS_DIR / f"{digits}.jpg"
+
+
+def save_recent_preview(sid, source_image):
+    """Salva um vislumbre reduzido e suavizado, sem texto facilmente legível."""
+    path = recent_preview_path(sid)
+    if path is None or source_image is None:
+        return None
+    try:
+        image = source_image.convert("RGB")
+        width, height = image.size
+        if width < 1 or height < 1:
+            return None
+
+        target_ratio = 16 / 9
+        source_ratio = width / height
+        if source_ratio > target_ratio:
+            crop_width = max(1, int(height * target_ratio))
+            left = (width - crop_width) // 2
+            image = image.crop((left, 0, left + crop_width, height))
+        elif source_ratio < target_ratio:
+            crop_height = max(1, int(width / target_ratio))
+            top = (height - crop_height) // 2
+            image = image.crop((0, top, width, top + crop_height))
+
+        image = image.resize((480, 270), Image.Resampling.LANCZOS)
+        image = image.filter(ImageFilter.GaussianBlur(radius=2.4))
+        image = ImageEnhance.Brightness(image).enhance(0.68)
+
+        RECENT_PREVIEWS_DIR.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(".tmp")
+        image.save(temp, "JPEG", quality=72, optimize=True, progressive=True)
+        os.replace(temp, path)
+        return path
+    except Exception:
+        return None
+
+
+def prune_recent_previews(valid_ids):
+    valid = {
+        "".join(c for c in str(value) if c.isdigit())
+        for value in valid_ids
+    }
+    try:
+        if not RECENT_PREVIEWS_DIR.exists():
+            return
+        for path in RECENT_PREVIEWS_DIR.glob("*.jpg"):
+            if path.stem not in valid:
+                path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def map_key_name(key):
     key = (key or "").lower()
     mapping = {
@@ -200,11 +259,70 @@ def add_shadow(widget, blur=22, y=4):
     widget.setGraphicsEffect(effect)
 
 
+def available_monitors():
+    """Retorna somente monitores físicos, sem a entrada virtual agregada do mss."""
+    try:
+        with mss.mss() as capture:
+            monitors = []
+            for index, raw in enumerate(capture.monitors[1:], 1):
+                monitors.append({
+                    "id": index,
+                    "label": f"Tela {index}",
+                    "left": int(raw.get("left", 0)),
+                    "top": int(raw.get("top", 0)),
+                    "width": int(raw.get("width", 1)),
+                    "height": int(raw.get("height", 1)),
+                    "primary": (
+                        int(raw.get("left", 0)) == 0
+                        and int(raw.get("top", 0)) == 0
+                    ),
+                })
+            if monitors:
+                if not any(item["primary"] for item in monitors):
+                    monitors[0]["primary"] = True
+                return monitors
+    except Exception:
+        pass
+
+    width, height = pyautogui.size()
+    return [{
+        "id": 1,
+        "label": "Tela 1",
+        "left": 0,
+        "top": 0,
+        "width": int(width),
+        "height": int(height),
+        "primary": True,
+    }]
+
+
+def move_pointer_absolute(x, y):
+    """Move inclusive para coordenadas negativas do desktop virtual do Windows."""
+    if sys.platform == "win32":
+        if not ctypes.windll.user32.SetCursorPos(int(x), int(y)):
+            raise OSError("Não foi possível mover o ponteiro")
+        return
+    pyautogui.moveTo(int(x), int(y), duration=0)
+
+
+def exclude_window_from_capture(widget):
+    """Evita que o painel do proprietário apareça na captura, quando suportado."""
+    if sys.platform != "win32":
+        return False
+    try:
+        # WDA_EXCLUDEFROMCAPTURE (Windows 10 2004+).
+        return bool(ctypes.windll.user32.SetWindowDisplayAffinity(int(widget.winId()), 0x11))
+    except Exception:
+        return False
+
+
 class UiBridge(QObject):
     host_status = Signal(str, bool)
     internet_status = Signal(str, bool)
     host_connections = Signal(int)
-    ask_accept = Signal(str, str, object)
+    ask_accept = Signal(str, str, str, object)
+    host_session_started = Signal(str, str, str)
+    host_session_ended = Signal(str)
     ask_file = Signal(object)
     notify = Signal(str, str)
     pin_changed = Signal(str)
@@ -300,7 +418,10 @@ class HostService:
         self.bridge = bridge
         self.stop_event = threading.Event()
         self.connections = set()
+        self.session_connections = {}
         self.lock = threading.Lock()
+        self.protected_regions = {}
+        self.protected_regions_lock = threading.Lock()
         self.pin_lock = threading.Lock()
         self.attempts = {}
         self.connection_slots = threading.BoundedSemaphore(32)
@@ -327,6 +448,40 @@ class HostService:
                 conn.close()
             except Exception:
                 pass
+
+    def disconnect_session(self, session_token):
+        with self.lock:
+            conn = self.session_connections.get(str(session_token))
+        if not conn:
+            return False
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return True
+
+    def set_protected_region(self, session_token, rect):
+        token = str(session_token)
+        with self.protected_regions_lock:
+            if rect is None:
+                self.protected_regions.pop(token, None)
+            else:
+                x, y, width, height = rect
+                self.protected_regions[token] = (
+                    int(x), int(y), max(0, int(width)), max(0, int(height))
+                )
+
+    def _is_protected_point(self, x, y):
+        with self.protected_regions_lock:
+            regions = tuple(self.protected_regions.values())
+        return any(
+            left <= x < left + width and top <= y < top + height
+            for left, top, width, height in regions
+        )
 
     def _server_loop(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -391,10 +546,11 @@ class HostService:
             self.bridge.pin_changed.emit(self.pin)
             return True, ""
 
-    def _ask_accept(self, controller, ip):
+    def _ask_accept(self, controller, ip, session_token):
         response = {"event": threading.Event(), "ok": False}
-        self.bridge.ask_accept.emit(controller, ip, response)
-        response["event"].wait(60)
+        self.bridge.ask_accept.emit(controller, ip, session_token, response)
+        if not response["event"].wait(60):
+            self.bridge.host_session_ended.emit(session_token)
         return bool(response["ok"])
 
     def _ask_file(self):
@@ -449,7 +605,7 @@ class HostService:
                     f"{hello.get('controller') or 'Técnico'} (LAN, identidade não cadastrada)\n"
                     f"Dispositivo {conn.peer_fingerprint}"
                 )
-            accepted = self._ask_accept(controller_label, addr[0])
+            accepted = self._ask_accept(controller_label, addr[0], session_token)
             if self.audit_callback:
                 threading.Thread(
                     target=self.audit_callback, args=(session_token, accepted), daemon=True
@@ -467,26 +623,43 @@ class HostService:
                     args=("lan_session_started", session_token, {}), daemon=True,
                 ).start()
 
+            monitors = available_monitors()
+            initial_monitor = next(
+                (item for item in monitors if item.get("primary")), monitors[0]
+            )
+            session_state = {
+                "monitor_index": int(initial_monitor["id"]),
+                "monitors": monitors,
+                "lock": threading.Lock(),
+            }
+
             with self.lock:
                 self.connections.add(conn)
+                self.session_connections[session_token] = conn
                 count = len(self.connections)
             self.bridge.host_connections.emit(count)
+            self.bridge.host_session_started.emit(
+                session_token, controller_label, str(addr[0])
+            )
 
-            sw, sh = pyautogui.size()
             send_json(conn, {
                 "type": "hello_ok",
                 "host": socket.gethostname(),
-                "screen_width": sw,
-                "screen_height": sh,
+                "screen_width": initial_monitor["width"],
+                "screen_height": initial_monitor["height"],
+                "monitors": monitors,
+                "selected_monitor": int(initial_monitor["id"]),
             }, send_lock)
 
             threading.Thread(
                 target=self._screen_sender,
-                args=(conn, send_lock, stop_conn),
+                args=(conn, send_lock, stop_conn, session_state),
                 daemon=True,
             ).start()
 
-            self._command_loop(conn, send_lock, stop_conn, session_token)
+            self._command_loop(
+                conn, send_lock, stop_conn, session_token, session_state
+            )
 
         except Exception:
             pass
@@ -498,8 +671,12 @@ class HostService:
                 pass
             with self.lock:
                 self.connections.discard(conn)
+                self.session_connections.pop(session_token, None)
                 count = len(self.connections)
             self.bridge.host_connections.emit(count)
+            self.set_protected_region(session_token, None)
+            if accepted:
+                self.bridge.host_session_ended.emit(session_token)
             if accepted and not is_relay_session and self.event_callback:
                 threading.Thread(
                     target=self.event_callback,
@@ -507,7 +684,7 @@ class HostService:
                 ).start()
             self.connection_slots.release()
 
-    def _screen_sender(self, conn, send_lock, stop_conn):
+    def _screen_sender(self, conn, send_lock, stop_conn, session_state):
         """Streaming LAN adaptativo.
 
         O objetivo aqui não é guardar todos os frames; em suporte remoto,
@@ -526,11 +703,14 @@ class HostService:
             target_delay = 1 / FPS
 
             with mss.mss() as sct:
-                monitor = sct.monitors[1]
-
                 while not self.stop_event.is_set() and not stop_conn.is_set():
                     started = time.perf_counter()
 
+                    with session_state["lock"]:
+                        monitor_index = int(session_state["monitor_index"])
+                    if not 1 <= monitor_index < len(sct.monitors):
+                        monitor_index = 1
+                    monitor = sct.monitors[monitor_index]
                     shot = sct.grab(monitor)
                     img = Image.frombytes("RGB", shot.size, shot.rgb)
                     src_w, src_h = img.size
@@ -552,6 +732,13 @@ class HostService:
                     )
 
                     packet = struct.pack("!II", src_w, src_h) + buf.getvalue()
+
+                    # A troca pode ocorrer enquanto o frame anterior ainda está
+                    # sendo codificado. Não envia esse frame obsoleto depois da
+                    # confirmação da nova tela.
+                    with session_state["lock"]:
+                        if int(session_state["monitor_index"]) != monitor_index:
+                            continue
 
                     before_send = time.perf_counter()
                     send_frame(conn, b"S", packet, send_lock)
@@ -575,7 +762,30 @@ class HostService:
         except Exception:
             stop_conn.set()
 
-    def _command_loop(self, conn, send_lock, stop_conn, session_token=""):
+    @staticmethod
+    def _selected_monitor(session_state):
+        with session_state["lock"]:
+            index = int(session_state["monitor_index"])
+            monitors = session_state["monitors"]
+            if not 1 <= index <= len(monitors):
+                index = 1
+                session_state["monitor_index"] = index
+            return dict(monitors[index - 1])
+
+    def _monitor_point(self, msg, session_state):
+        monitor = self._selected_monitor(session_state)
+        local_x = max(0, min(int(msg["x"]), monitor["width"] - 1))
+        local_y = max(0, min(int(msg["y"]), monitor["height"] - 1))
+        return monitor["left"] + local_x, monitor["top"] + local_y
+
+    def _command_loop(
+        self, conn, send_lock, stop_conn, session_token="", session_state=None
+    ):
+        session_state = session_state or {
+            "monitor_index": 1,
+            "monitors": available_monitors(),
+            "lock": threading.Lock(),
+        }
         upload = None
         upload_fh = None
         try:
@@ -587,13 +797,25 @@ class HostService:
                     t = msg.get("type")
 
                     if t == "mouse_move":
-                        pyautogui.moveTo(int(msg["x"]), int(msg["y"]), duration=0)
+                        x, y = self._monitor_point(msg, session_state)
+                        if not self._is_protected_point(x, y):
+                            move_pointer_absolute(x, y)
                     elif t == "mouse_down":
-                        pyautogui.mouseDown(int(msg["x"]), int(msg["y"]), button=msg.get("button", "left"))
+                        x, y = self._monitor_point(msg, session_state)
+                        if not self._is_protected_point(x, y):
+                            move_pointer_absolute(x, y)
+                            pyautogui.mouseDown(button=msg.get("button", "left"))
                     elif t == "mouse_up":
-                        pyautogui.mouseUp(int(msg["x"]), int(msg["y"]), button=msg.get("button", "left"))
+                        x, y = self._monitor_point(msg, session_state)
+                        if self._is_protected_point(x, y):
+                            pyautogui.mouseUp(button=msg.get("button", "left"))
+                        else:
+                            move_pointer_absolute(x, y)
+                            pyautogui.mouseUp(button=msg.get("button", "left"))
                     elif t == "scroll":
-                        pyautogui.scroll(int(msg.get("delta", 0)))
+                        cursor_x, cursor_y = pyautogui.position()
+                        if not self._is_protected_point(cursor_x, cursor_y):
+                            pyautogui.scroll(int(msg.get("delta", 0)))
                     elif t == "key_down":
                         key = map_key_name(msg.get("key"))
                         if key:
@@ -602,6 +824,25 @@ class HostService:
                         key = map_key_name(msg.get("key"))
                         if key:
                             pyautogui.keyUp(key)
+
+                    elif t == "select_monitor":
+                        requested = int(msg.get("monitor", 0))
+                        with session_state["lock"]:
+                            monitors = session_state["monitors"]
+                            if not 1 <= requested <= len(monitors):
+                                send_json(conn, {
+                                    "type": "error",
+                                    "message": "Tela solicitada não está disponível.",
+                                }, send_lock)
+                                continue
+                            session_state["monitor_index"] = requested
+                            selected = dict(monitors[requested - 1])
+                        send_json(conn, {
+                            "type": "monitor_selected",
+                            "monitor": requested,
+                            "screen_width": selected["width"],
+                            "screen_height": selected["height"],
+                        }, send_lock)
 
                     elif t == "file_start":
                         if upload_fh:
@@ -702,12 +943,51 @@ class HostService:
 
 class SessionBridge(QObject):
     connected = Signal(str, str)
+    monitors_changed = Signal(object, int)
     failed = Signal(str)
     frame = Signal(object)
     status = Signal(str)
     notify = Signal(str, str)
     disconnected = Signal()
     progress = Signal(int)
+
+
+class RecentPreview(QLabel):
+    """Miniatura responsiva usada nos cartões de últimos acessos."""
+
+    def __init__(self, sid, parent=None):
+        super().__init__(parent)
+        self.source_pixmap = QPixmap()
+        self.setObjectName("RecentPreview")
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumHeight(96)
+        self.setMaximumHeight(96)
+        self.setText("TELA REMOTA")
+
+        path = recent_preview_path(sid)
+        if path and path.exists():
+            pixmap = QPixmap(str(path))
+            if not pixmap.isNull():
+                self.source_pixmap = pixmap
+                self.setText("")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._draw_preview()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._draw_preview()
+
+    def _draw_preview(self):
+        if self.source_pixmap.isNull() or self.width() < 2 or self.height() < 2:
+            return
+        scaled = self.source_pixmap.scaled(
+            self.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+        )
+        x = max(0, (scaled.width() - self.width()) // 2)
+        y = max(0, (scaled.height() - self.height()) // 2)
+        self.setPixmap(scaled.copy(x, y, self.width(), self.height()))
 
 
 class RemoteScreen(QLabel):
@@ -848,6 +1128,7 @@ class RemoteSession(QWidget):
     titleChanged = Signal(str)
     stateChanged = Signal(str)
     closed = Signal(object)
+    previewReady = Signal(str, object)
 
     def __init__(
         self, peer, sid, pin, identity, controller_name="", event_callback=None,
@@ -868,7 +1149,11 @@ class RemoteSession(QWidget):
         self.send_lock = threading.Lock()
         self.remote_w = 1
         self.remote_h = 1
+        self.monitors = []
+        self.current_monitor = 1
+        self.monitor_buttons = []
         self.last_pil = None
+        self.preview_emitted = False
         self.last_mouse_send = 0
         self.download_fh = None
         self.download_path = None
@@ -878,6 +1163,7 @@ class RemoteSession(QWidget):
 
         self.bridge = SessionBridge()
         self.bridge.connected.connect(self._on_connected)
+        self.bridge.monitors_changed.connect(self._on_monitors_changed)
         self.bridge.failed.connect(self._on_failed)
         self.bridge.frame.connect(self._on_frame)
         self.bridge.status.connect(self._on_status)
@@ -900,6 +1186,17 @@ class RemoteSession(QWidget):
         self.title_label = QLabel(f"Conectando a {self.peer['name']}…")
         self.title_label.setObjectName("SectionTitle")
         toolbar.addWidget(self.title_label)
+
+        self.monitor_widget = QWidget()
+        monitor_layout = QHBoxLayout(self.monitor_widget)
+        monitor_layout.setContentsMargins(8,0,0,0)
+        monitor_layout.setSpacing(5)
+        monitor_label = QLabel("Telas:")
+        monitor_label.setObjectName("Muted")
+        monitor_layout.addWidget(monitor_label)
+        self.monitor_buttons_layout = monitor_layout
+        self.monitor_widget.hide()
+        toolbar.addWidget(self.monitor_widget)
         toolbar.addStretch(1)
 
         self.send_btn = QPushButton("Enviar arquivo")
@@ -1013,10 +1310,19 @@ class RemoteSession(QWidget):
 
             self.remote_w = int(msg.get("screen_width",1))
             self.remote_h = int(msg.get("screen_height",1))
+            monitors = msg.get("monitors") or [{
+                "id": 1,
+                "label": "Tela 1",
+                "width": self.remote_w,
+                "height": self.remote_h,
+                "primary": True,
+            }]
+            selected_monitor = int(msg.get("selected_monitor") or 1)
             self.connected_flag = True
             if self.peer_key_callback:
                 self.peer_key_callback(self.sid, sock.peer_public_key, msg.get("host") or self.peer["name"])
             self.bridge.connected.emit(msg.get("host") or self.peer["name"], self.peer["ip"])
+            self.bridge.monitors_changed.emit(monitors, selected_monitor)
             self._reader_loop(sock)
 
         except Exception as e:
@@ -1085,6 +1391,14 @@ class RemoteSession(QWidget):
                     elif t == "error":
                         self.bridge.status.emit(msg.get("message","Erro remoto."))
 
+                    elif t == "monitor_selected":
+                        self.remote_w = int(msg.get("screen_width", self.remote_w))
+                        self.remote_h = int(msg.get("screen_height", self.remote_h))
+                        self.bridge.monitors_changed.emit(
+                            self.monitors,
+                            int(msg.get("monitor") or self.current_monitor),
+                        )
+
                 elif kind == b"D" and self.download_fh:
                     if self.download["received"] + len(payload) > self.download["size"]:
                         raise ValueError("Arquivo excedeu o tamanho declarado")
@@ -1125,6 +1439,50 @@ class RemoteSession(QWidget):
         self.titleChanged.emit(name)
         self.stateChanged.emit("connected")
 
+    def _on_monitors_changed(self, monitors, selected):
+        if monitors:
+            self.monitors = list(monitors)
+        self.current_monitor = max(1, int(selected or 1))
+
+        while self.monitor_buttons_layout.count() > 1:
+            item = self.monitor_buttons_layout.takeAt(1)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        self.monitor_buttons = []
+
+        for monitor in self.monitors:
+            monitor_id = int(monitor.get("id") or len(self.monitor_buttons) + 1)
+            label = str(monitor.get("label") or f"Tela {monitor_id}")
+            button = QPushButton(label)
+            button.setObjectName("MonitorButton")
+            button.setProperty("monitorId", monitor_id)
+            button.setCheckable(True)
+            button.setChecked(monitor_id == self.current_monitor)
+            button.setToolTip(
+                f"{int(monitor.get('width', 0))} × {int(monitor.get('height', 0))}"
+                + (" • principal" if monitor.get("primary") else "")
+            )
+            button.clicked.connect(
+                lambda checked=False, value=monitor_id: self.select_monitor(value)
+            )
+            self.monitor_buttons_layout.addWidget(button)
+            self.monitor_buttons.append(button)
+
+        self.monitor_widget.setVisible(len(self.monitors) > 1)
+
+    def select_monitor(self, monitor_id):
+        if not self.connected_flag:
+            return
+        monitor_id = int(monitor_id)
+        if not any(int(item.get("id") or 0) == monitor_id for item in self.monitors):
+            return
+        self.current_monitor = monitor_id
+        for button in self.monitor_buttons:
+            button.setChecked(int(button.property("monitorId")) == monitor_id)
+        self.status_label.setText(f"Alterando para Tela {monitor_id}…")
+        self._safe_send({"type": "select_monitor", "monitor": monitor_id})
+
     def _on_failed(self, msg):
         self.status_label.setText(f"Falha: {msg}")
         self.screen.clear()
@@ -1146,6 +1504,9 @@ class RemoteSession(QWidget):
     def _on_frame(self, pil_img):
         self.last_pil = pil_img
         self._draw_frame()
+        if not self.preview_emitted:
+            self.preview_emitted = True
+            self.previewReady.emit(self.sid, pil_img.copy())
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1290,6 +1651,184 @@ class _RelayFallbackEvent(QEvent):
         self.pin = pin
 
 
+class OwnerAccessWindow(QWidget):
+    """Painel persistente e local para o proprietário controlar um acesso."""
+
+    def __init__(
+        self, session_token, controller, origin, decision_callback,
+        end_callback, region_callback
+    ):
+        flags = (
+            Qt.Tool
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowDoesNotAcceptFocus
+            | Qt.CustomizeWindowHint
+            | Qt.WindowTitleHint
+            | Qt.WindowMinimizeButtonHint
+        )
+        super().__init__(None, flags)
+        self.session_token = str(session_token)
+        self.controller = str(controller)
+        self.origin = str(origin)
+        self.decision_callback = decision_callback
+        self.end_callback = end_callback
+        self.region_callback = region_callback
+        self.pending = True
+        self._closing = False
+
+        self.setObjectName("OwnerAccessWindow")
+        self.setWindowTitle(f"{APP_NAME} - Controle do acesso")
+        self.setWindowIcon(QIcon(resource_path("assets/conectapc.ico")))
+        self.setFixedWidth(430)
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22,20,22,20)
+        layout.setSpacing(13)
+
+        header = QHBoxLayout()
+        logo = QLabel()
+        pix = QPixmap(resource_path("assets/conectapc-logo.png"))
+        logo.setPixmap(pix.scaled(38,38,Qt.KeepAspectRatio,Qt.SmoothTransformation))
+        logo.setFixedSize(42,42)
+        header.addWidget(logo)
+
+        heading = QVBoxLayout()
+        heading.setSpacing(1)
+        title = QLabel("Solicitação de acesso remoto")
+        title.setObjectName("OwnerAccessTitle")
+        heading.addWidget(title)
+        subtitle = QLabel("Este painel pertence ao dono do computador")
+        subtitle.setObjectName("Muted")
+        heading.addWidget(subtitle)
+        header.addLayout(heading, 1)
+        layout.addLayout(header)
+
+        self.state_label = QLabel("AGUARDANDO SUA AUTORIZAÇÃO")
+        self.state_label.setObjectName("AccessPending")
+        self.state_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.state_label)
+
+        controller_title = QLabel("QUEM ESTÁ SOLICITANDO")
+        controller_title.setObjectName("FieldEyebrow")
+        layout.addWidget(controller_title)
+
+        self.controller_label = QLabel(self.controller)
+        self.controller_label.setObjectName("OwnerController")
+        self.controller_label.setWordWrap(True)
+        self.controller_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.controller_label)
+
+        origin_label = QLabel(f"Origem da conexão: {self.origin}")
+        origin_label.setObjectName("Muted")
+        layout.addWidget(origin_label)
+
+        permissions = QFrame()
+        permissions.setObjectName("OwnerPermissions")
+        permissions_layout = QVBoxLayout(permissions)
+        permissions_layout.setContentsMargins(13,10,13,10)
+        permissions_layout.setSpacing(4)
+        permissions_layout.addWidget(QLabel("✓ Visualizar sua tela"))
+        permissions_layout.addWidget(QLabel("✓ Controlar mouse e teclado"))
+        permissions_layout.addWidget(QLabel("✓ Transferir arquivos"))
+        layout.addWidget(permissions)
+
+        self.decision_widget = QWidget()
+        decision_layout = QHBoxLayout(self.decision_widget)
+        decision_layout.setContentsMargins(0,0,0,0)
+        decision_layout.setSpacing(9)
+        reject_button = QPushButton("Recusar")
+        reject_button.setObjectName("Danger")
+        reject_button.clicked.connect(lambda: self._decide(False))
+        decision_layout.addWidget(reject_button)
+        allow_button = QPushButton("Permitir acesso")
+        allow_button.setObjectName("Primary")
+        allow_button.clicked.connect(lambda: self._decide(True))
+        decision_layout.addWidget(allow_button, 1)
+        layout.addWidget(self.decision_widget)
+
+        self.end_button = QPushButton("Encerrar acesso agora")
+        self.end_button.setObjectName("DangerPrimary")
+        self.end_button.clicked.connect(self._request_end)
+        self.end_button.hide()
+        layout.addWidget(self.end_button)
+
+        safety = QLabel(
+            "O técnico remoto não pode usar esta sessão para acionar os controles deste painel."
+        )
+        safety.setObjectName("OwnerSafety")
+        safety.setWordWrap(True)
+        layout.addWidget(safety)
+
+    def _decide(self, allowed):
+        if not self.pending:
+            return
+        self.pending = False
+        self.decision_callback(bool(allowed))
+        if allowed:
+            self.state_label.setText("PREPARANDO CONEXÃO…")
+            self.state_label.setObjectName("AccessConnecting")
+            self.decision_widget.hide()
+            self._refresh_state_style()
+        else:
+            self.finish()
+
+    def mark_active(self):
+        self.pending = False
+        self.state_label.setText("●  ACESSO EM ANDAMENTO")
+        self.state_label.setObjectName("AccessActive")
+        self.decision_widget.hide()
+        self.end_button.show()
+        self._refresh_state_style()
+        self.showNormal()
+        self.raise_()
+
+    def _request_end(self):
+        self.end_button.setEnabled(False)
+        self.end_button.setText("Encerrando acesso…")
+        self.state_label.setText("ENCERRANDO SESSÃO…")
+        self.state_label.setObjectName("AccessConnecting")
+        self._refresh_state_style()
+        self.end_callback()
+
+    def _refresh_state_style(self):
+        self.state_label.style().unpolish(self.state_label)
+        self.state_label.style().polish(self.state_label)
+
+    def finish(self):
+        if self._closing:
+            return
+        self._closing = True
+        self.region_callback(None)
+        self.hide()
+        self.deleteLater()
+
+    def _publish_region(self):
+        if self._closing or not self.isVisible() or self.isMinimized():
+            self.region_callback(None)
+            return
+        rect = self.frameGeometry()
+        self.region_callback((rect.x(), rect.y(), rect.width(), rect.height()))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        exclude_window_from_capture(self)
+        QTimer.singleShot(0, self._publish_region)
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        QTimer.singleShot(0, self._publish_region)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._publish_region)
+
+    def hideEvent(self, event):
+        self.region_callback(None)
+        super().hideEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1304,17 +1843,21 @@ class MainWindow(QMainWindow):
         self.pin = random_pin()
         self.ip = local_ip()
         self.recents = load_recents()
+        prune_recent_previews(item.get("id") for item in self.recents)
         self.sessions = []
         self.session_titles = {}
         self.session_states = {}
         self.session_view_mode = "tabs"
         self.last_tab_session = None
+        self.owner_access_windows = {}
 
         self.bridge = UiBridge()
         self.bridge.host_status.connect(self._set_status)
         self.bridge.internet_status.connect(self._set_internet_status)
         self.bridge.host_connections.connect(self._set_incoming_count)
         self.bridge.ask_accept.connect(self._ask_accept_ui)
+        self.bridge.host_session_started.connect(self._host_session_started)
+        self.bridge.host_session_ended.connect(self._host_session_ended)
         self.bridge.ask_file.connect(self._ask_file_ui)
         self.bridge.notify.connect(lambda t,m: QMessageBox.information(self,t,m))
         self.bridge.pin_changed.connect(self._set_new_pin)
@@ -1512,9 +2055,17 @@ class MainWindow(QMainWindow):
         pin_field_layout.addLayout(pinrow)
         ll.addWidget(pin_field)
 
+        incoming_row = QHBoxLayout()
+        incoming_row.setSpacing(8)
         self.incoming_label = QLabel("●  Aguardando solicitação de acesso")
         self.incoming_label.setObjectName("IncomingStatus")
-        ll.addWidget(self.incoming_label)
+        incoming_row.addWidget(self.incoming_label, 1)
+        self.view_access_btn = QPushButton("Ver acesso ativo")
+        self.view_access_btn.setObjectName("OwnerAccessButton")
+        self.view_access_btn.clicked.connect(self._show_owner_access_windows)
+        self.view_access_btn.hide()
+        incoming_row.addWidget(self.view_access_btn)
+        ll.addLayout(incoming_row)
 
         cards.addWidget(local_card, 1)
 
@@ -1806,6 +2357,7 @@ class MainWindow(QMainWindow):
             item = self.recents_layout.takeAt(0)
             widget = item.widget()
             if widget:
+                widget.hide()
                 widget.deleteLater()
 
         self.clear_recents_btn.setEnabled(bool(self.recents))
@@ -1821,19 +2373,17 @@ class MainWindow(QMainWindow):
         for index, item in enumerate(self.recents[:6]):
             tile = QFrame()
             tile.setObjectName("RecentRow")
-            tile.setMinimumHeight(104)
+            tile.setMinimumHeight(176)
             tile.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             tile_layout = QVBoxLayout(tile)
-            tile_layout.setContentsMargins(12,10,12,10)
-            tile_layout.setSpacing(7)
+            tile_layout.setContentsMargins(8,8,8,8)
+            tile_layout.setSpacing(8)
+
+            preview = RecentPreview(item["id"])
+            tile_layout.addWidget(preview)
 
             top = QHBoxLayout()
             top.setSpacing(9)
-            recent_icon = QLabel("PC")
-            recent_icon.setObjectName("RecentIcon")
-            recent_icon.setAlignment(Qt.AlignCenter)
-            recent_icon.setFixedSize(36,36)
-            top.addWidget(recent_icon)
 
             name_box = QVBoxLayout()
             name_box.setSpacing(1)
@@ -1849,14 +2399,15 @@ class MainWindow(QMainWindow):
             details.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             name_box.addWidget(details)
             top.addLayout(name_box, 1)
-            tile_layout.addLayout(top)
 
             use_btn = QPushButton("Conectar")
             use_btn.setObjectName("RecentAction")
+            use_btn.setMinimumWidth(82)
             use_btn.clicked.connect(
                 lambda checked=False, sid=item["id"]: self.use_recent(sid)
             )
-            tile_layout.addWidget(use_btn)
+            top.addWidget(use_btn)
+            tile_layout.addLayout(top)
 
             self.recents_layout.addWidget(tile, index // 3, index % 3)
 
@@ -1878,6 +2429,7 @@ class MainWindow(QMainWindow):
             return
         self.recents = []
         save_recents(self.recents)
+        prune_recent_previews(())
         self.refresh_recents_ui()
 
     def remember_access(self, sid, name):
@@ -1893,7 +2445,14 @@ class MainWindow(QMainWindow):
         })
         self.recents = self.recents[:8]
         save_recents(self.recents)
+        prune_recent_previews(item.get("id") for item in self.recents)
         self.refresh_recents_ui()
+
+    def _update_recent_preview(self, sid, image):
+        if save_recent_preview(sid, image) and any(
+            item.get("id") == sid for item in self.recents
+        ):
+            self.refresh_recents_ui()
 
     def show_dashboard(self):
         if self.isFullScreen():
@@ -2076,6 +2635,7 @@ class MainWindow(QMainWindow):
             self.login_btn.setEnabled(bool(online))
 
     def _set_incoming_count(self, n):
+        self.view_access_btn.setVisible(n > 0)
         if n == 0:
             self.incoming_label.setText("●  Aguardando solicitação de acesso")
         elif n == 1:
@@ -2153,6 +2713,16 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.Accepted:
             return False
 
+        try:
+            name = self.relay.login_technician(
+                username.text(), password.text(), otp.text()
+            )
+            self.login_btn.setText(f"Técnico: {name}")
+            return True
+        except Exception as exc:
+            QMessageBox.critical(self, "Autenticação", str(exc))
+            return False
+
     def _enroll_device_ui(self):
         token, ok = QInputDialog.getText(
             self, "Cadastrar computador",
@@ -2169,32 +2739,55 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             QMessageBox.critical(self, "Cadastro", str(exc))
-        try:
-            name = self.relay.login_technician(username.text(), password.text(), otp.text())
-            self.login_btn.setText(f"Técnico: {name}")
-            return True
-        except Exception as exc:
-            QMessageBox.critical(self, "Autenticação", str(exc))
-            return False
 
-    def _ask_accept_ui(self, controller, ip, response):
-        box = QMessageBox(self)
-        box.setWindowTitle("Solicitação de acesso")
-        box.setIcon(QMessageBox.Question)
-        box.setText(f"{controller} deseja acessar este computador.")
-        box.setInformativeText(
-            f"Origem: {ip}\n\n"
-            "Permissões solicitadas:\n"
-            "• Visualizar a tela\n"
-            "• Controlar mouse e teclado\n"
-            "• Transferir arquivos\n\n"
-            "Deseja permitir esta conexão?"
+    def _ask_accept_ui(self, controller, ip, session_token, response):
+        token = str(session_token)
+        previous = self.owner_access_windows.pop(token, None)
+        if previous:
+            previous.finish()
+
+        def decide(allowed):
+            if response["event"].is_set():
+                return
+            response["ok"] = bool(allowed)
+            response["event"].set()
+            if not allowed:
+                self.owner_access_windows.pop(token, None)
+
+        window = OwnerAccessWindow(
+            token,
+            controller,
+            ip,
+            decide,
+            lambda: self.host.disconnect_session(token),
+            lambda rect: self.host.set_protected_region(token, rect),
         )
-        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        box.button(QMessageBox.Yes).setText("Permitir")
-        box.button(QMessageBox.No).setText("Recusar")
-        response["ok"] = box.exec() == QMessageBox.Yes
-        response["event"].set()
+        self.owner_access_windows[token] = window
+        window.adjustSize()
+        screen = QApplication.primaryScreen()
+        if screen:
+            area = screen.availableGeometry()
+            window.move(
+                area.right() - window.width() - 24,
+                area.top() + 24,
+            )
+        window.show()
+        window.raise_()
+
+    def _host_session_started(self, session_token, _controller, _origin):
+        window = self.owner_access_windows.get(str(session_token))
+        if window:
+            window.mark_active()
+
+    def _host_session_ended(self, session_token):
+        window = self.owner_access_windows.pop(str(session_token), None)
+        if window:
+            window.finish()
+
+    def _show_owner_access_windows(self):
+        for window in tuple(self.owner_access_windows.values()):
+            window.showNormal()
+            window.raise_()
 
     def _ask_file_ui(self, response):
         path, _ = QFileDialog.getOpenFileName(self, "Escolha um arquivo para enviar")
@@ -2357,6 +2950,7 @@ class MainWindow(QMainWindow):
                 lambda title, s=session, sid=event.sid:
                     self._session_connected(s, sid, title)
             )
+            session.previewReady.connect(self._update_recent_preview)
             session.stateChanged.connect(
                 lambda state, s=session: self._session_state_changed(s, state)
             )
@@ -2380,6 +2974,8 @@ class MainWindow(QMainWindow):
         self.remember_access(sid, title)
 
     def _close_session_widget(self, session):
+        if session.last_pil is not None:
+            self._update_recent_preview(session.sid, session.last_pil.copy())
         idx = self.tabs.indexOf(session)
         if idx >= 0:
             self.tabs.removeTab(idx)
@@ -2409,6 +3005,9 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         for session in list(self.sessions):
             session.disconnect()
+        for window in tuple(self.owner_access_windows.values()):
+            window.finish()
+        self.owner_access_windows.clear()
         self.relay.stop()
         self.host.stop()
         self.discovery.stop()

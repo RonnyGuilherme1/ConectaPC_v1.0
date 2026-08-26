@@ -27,11 +27,15 @@ Assim, a configuração futura do VPS não desativa nem bloqueia as conexões lo
 ## Funcionalidades atuais
 
 - tela remota, mouse e teclado;
+- detecção de múltiplos monitores, com botões `Tela 1`, `Tela 2` e controle do mouse na tela selecionada;
 - múltiplas sessões simultâneas, com troca por abas ou visualização lado a lado;
+- miniaturas locais e suavizadas da última tela nos cartões de sessões recentes;
 - envio, recebimento e drag-and-drop de arquivos com tamanho e SHA-256;
 - conexão LAN direta;
 - conexão por relay sem abrir porta no roteador do cliente;
-- consentimento local obrigatório;
+- consentimento local obrigatório em uma janela separada e persistente;
+- painel do proprietário com identificação do solicitante, estado da conexão e encerramento imediato da sessão;
+- proteção do painel contra cliques remotos e exclusão da captura quando suportada pelo Windows;
 - contas de técnico com MFA;
 - cadastro e revogação de dispositivos;
 - auditoria de sessões e transferências sem conteúdo sensível;
@@ -100,4 +104,4 @@ O preflight testa configuração segura, DNS, TLS, chave de atualização, certi
 
 ## Limites conhecidos
 
-A versão 2.1 ainda é de acesso assistido. Ela não controla tela de login/UAC, não inicia como serviço Windows, não possui múltiplos monitores, clipboard, áudio, codec de vídeo por hardware, P2P/ICE ou reinício com reconexão. Esses itens continuam nas fases posteriores.
+A versão 2.1 ainda é de acesso assistido. Ela não controla tela de login/UAC, não inicia como serviço Windows e ainda não possui clipboard, áudio, codec de vídeo por hardware, P2P/ICE ou reinício com reconexão. Esses itens continuam nas fases posteriores.

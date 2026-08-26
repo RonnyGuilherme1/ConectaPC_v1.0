@@ -61,6 +61,14 @@ QFrame#Tip {
     border: 1px solid #2B3946;
     border-radius: 8px;
 }
+QWidget#OwnerAccessWindow {
+    background: #111820;
+}
+QFrame#OwnerPermissions {
+    background: #172431;
+    border: 1px solid #2D4051;
+    border-radius: 8px;
+}
 QScrollArea#DashboardScroll {
     background: #11161C;
     border: 0px;
@@ -105,6 +113,46 @@ QLabel#PageTitle {
     color: #F4F8FB;
     font-size: 17pt;
     font-weight: 700;
+}
+QLabel#OwnerAccessTitle {
+    color: #F4F8FB;
+    font-size: 13pt;
+    font-weight: 700;
+}
+QLabel#OwnerController {
+    color: #F0F6FA;
+    background: #0D141B;
+    border: 1px solid #334653;
+    border-radius: 7px;
+    padding: 10px;
+    font-size: 10pt;
+    font-weight: 600;
+}
+QLabel#AccessPending, QLabel#AccessConnecting, QLabel#AccessActive {
+    border-radius: 7px;
+    padding: 8px 10px;
+    font-size: 9pt;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+QLabel#AccessPending {
+    color: #FFD87A;
+    background: #3B3018;
+    border: 1px solid #6B5624;
+}
+QLabel#AccessConnecting {
+    color: #70C8F2;
+    background: #173247;
+    border: 1px solid #2B6689;
+}
+QLabel#AccessActive {
+    color: #58E39A;
+    background: #153328;
+    border: 1px solid #255C43;
+}
+QLabel#OwnerSafety {
+    color: #8195A7;
+    font-size: 8.5pt;
 }
 QLabel#PageSubtitle, QLabel#CardDescription {
     color: #91A2B3;
@@ -240,6 +288,14 @@ QLabel#RecentIcon {
     font-size: 8pt;
     font-weight: 700;
 }
+QLabel#RecentPreview {
+    color: #7890A3;
+    background: #0B1219;
+    border: 1px solid #304659;
+    border-radius: 7px;
+    font-size: 8pt;
+    font-weight: 700;
+}
 QLabel#RecentName {
     color: #F2F7FA;
     font-size: 10pt;
@@ -338,6 +394,36 @@ QPushButton#RecentAction {
     border-color: #2A5975;
     padding: 6px 10px;
     font-size: 9pt;
+}
+QPushButton#MonitorButton {
+    color: #9EB0C0;
+    background: #18212A;
+    border: 1px solid #344A5A;
+    border-radius: 6px;
+    padding: 5px 9px;
+    font-size: 8.5pt;
+}
+QPushButton#MonitorButton:checked {
+    color: #FFFFFF;
+    background: #1689C2;
+    border-color: #2296D2;
+}
+QPushButton#OwnerAccessButton {
+    color: #70C8F2;
+    background: #142A39;
+    border-color: #2B6588;
+    padding: 5px 9px;
+    font-size: 8.5pt;
+}
+QPushButton#DangerPrimary {
+    color: #FFFFFF;
+    background: #C83C4B;
+    border-color: #D84A59;
+    min-height: 24px;
+}
+QPushButton#DangerPrimary:hover {
+    background: #DF4858;
+    border-color: #E85A69;
 }
 QPushButton#RecentAction:hover {
     color: #FFFFFF;
