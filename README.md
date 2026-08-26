@@ -15,10 +15,19 @@ Aplicativo Windows para suporte remoto assistido em LAN ou pela internet. A vers
 
 O relay transporta bytes criptografados e não recebe conteúdo de tela, comandos, código temporário ou arquivos em texto claro.
 
+## Modos de funcionamento
+
+O ConectaPC funciona em modo automático e não depende do VPS para uso local:
+
+1. **Rede local:** com `relay_config.json` usando `"enabled": false`, dois computadores na mesma LAN podem se conectar diretamente por ID e código temporário. Não há login de técnico nem servidor intermediário.
+2. **Rede local + VPS:** quando o relay for configurado, o aplicativo continua procurando o ID primeiro na LAN. O login do técnico e o túnel pelo servidor só são solicitados se o computador não for encontrado localmente.
+
+Assim, a configuração futura do VPS não desativa nem bloqueia as conexões locais. Para testar a LAN, abra o ConectaPC em dois computadores da mesma rede, informe no primeiro o ID e o código exibidos no segundo e permita o acesso no computador remoto.
+
 ## Funcionalidades atuais
 
 - tela remota, mouse e teclado;
-- múltiplas sessões em abas;
+- múltiplas sessões simultâneas, com troca por abas ou visualização lado a lado;
 - envio, recebimento e drag-and-drop de arquivos com tamanho e SHA-256;
 - conexão LAN direta;
 - conexão por relay sem abrir porta no roteador do cliente;

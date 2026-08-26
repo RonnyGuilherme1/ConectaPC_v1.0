@@ -19,9 +19,9 @@ from PIL import Image
 from PySide6.QtCore import QObject, Qt, Signal, QEvent
 from PySide6.QtGui import QIcon, QImage, QKeyEvent, QKeySequence, QMouseEvent, QPixmap, QShortcut, QWheelEvent
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGraphicsDropShadowEffect, QHBoxLayout,
+    QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGraphicsDropShadowEffect, QGridLayout, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QInputDialog,
-    QSizePolicy, QSpacerItem, QStackedWidget, QTabBar, QTabWidget, QVBoxLayout, QWidget
+    QScrollArea, QSizePolicy, QSpacerItem, QStackedWidget, QTabBar, QTabWidget, QVBoxLayout, QWidget
 )
 
 from protocol import recv_frame, recv_json_payload, send_frame, send_json
@@ -846,6 +846,7 @@ class RemoteScreen(QLabel):
 
 class RemoteSession(QWidget):
     titleChanged = Signal(str)
+    stateChanged = Signal(str)
     closed = Signal(object)
 
     def __init__(
@@ -873,6 +874,7 @@ class RemoteSession(QWidget):
         self.download_path = None
         self.download = None
         self.transfer_lock = threading.Lock()
+        self.compact_mode = False
 
         self.bridge = SessionBridge()
         self.bridge.connected.connect(self._on_connected)
@@ -946,12 +948,12 @@ class RemoteSession(QWidget):
     def set_immersive(self, enabled):
         """Esconde a interface da sessão para deixar apenas a tela remota."""
         self.toolbar_widget.setVisible(not enabled)
-        self.bottom_widget.setVisible(not enabled)
+        self.bottom_widget.setVisible(not enabled and not self.compact_mode)
         layout = self.layout()
         if layout:
-            margin = 0 if enabled else 14
+            margin = 0 if enabled else (8 if self.compact_mode else 14)
             layout.setContentsMargins(margin, margin, margin, margin)
-            layout.setSpacing(0 if enabled else 10)
+            layout.setSpacing(0 if enabled else (6 if self.compact_mode else 10))
         if enabled:
             self.screen.setStyleSheet(
                 "QLabel { background:#050A11; color:#B8C4D2; border:0px; border-radius:0px; }"
@@ -961,6 +963,23 @@ class RemoteSession(QWidget):
                 "QLabel { background:#0C1522; color:#B8C4D2; border-radius:12px; "
                 "border:1px solid #1E3147; font-size:11pt; }"
             )
+
+    def set_compact_mode(self, enabled):
+        """Ajusta uma sessão para compartilhar a área com outras telas."""
+        self.compact_mode = bool(enabled)
+        self.send_btn.setVisible(not enabled)
+        self.receive_btn.setVisible(not enabled)
+        self.bottom_widget.setVisible(not enabled)
+        self.screen.setMinimumHeight(180 if enabled else 420)
+        layout = self.layout()
+        if layout:
+            margin = 8 if enabled else 14
+            layout.setContentsMargins(margin, margin, margin, margin)
+            layout.setSpacing(6 if enabled else 10)
+        if enabled:
+            self.disconnect_btn.setText("Fechar")
+        else:
+            self.disconnect_btn.setText("Desconectar" if self.connected_flag else "Fechar aba")
 
     def _connect_thread(self):
         try:
@@ -1095,18 +1114,23 @@ class RemoteSession(QWidget):
             self.bridge.disconnected.emit()
 
     def _on_connected(self, name, ip):
-        self.title_label.setText(f"{name}  •  {ip}")
+        self.title_label.setText(f"●  {name}  •  {ip}")
+        self.title_label.setObjectName("SessionTitleOnline")
+        self.title_label.style().unpolish(self.title_label)
+        self.title_label.style().polish(self.title_label)
         self.status_label.setText("Conectado • arraste arquivos sobre a tela para enviar")
         self.send_btn.setEnabled(True)
         self.receive_btn.setEnabled(True)
         self.screen.setFocus()
         self.titleChanged.emit(name)
+        self.stateChanged.emit("connected")
 
     def _on_failed(self, msg):
         self.status_label.setText(f"Falha: {msg}")
         self.screen.clear()
         self.screen.setText("Não foi possível conectar.\n\n" + msg)
         self.disconnect_btn.setText("Fechar aba")
+        self.stateChanged.emit("failed")
 
     def _on_disconnected(self):
         self.connected_flag = False
@@ -1114,6 +1138,7 @@ class RemoteSession(QWidget):
         self.receive_btn.setEnabled(False)
         self.status_label.setText("Desconectado")
         self.disconnect_btn.setText("Fechar aba")
+        self.stateChanged.emit("disconnected")
 
     def _on_status(self, text):
         self.status_label.setText(text)
@@ -1256,6 +1281,15 @@ class _OpenSessionEvent(QEvent):
         self.error = error
 
 
+class _RelayFallbackEvent(QEvent):
+    TYPE = QEvent.Type(QEvent.registerEventType())
+
+    def __init__(self, sid, pin):
+        super().__init__(self.TYPE)
+        self.sid = sid
+        self.pin = pin
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1270,6 +1304,11 @@ class MainWindow(QMainWindow):
         self.pin = random_pin()
         self.ip = local_ip()
         self.recents = load_recents()
+        self.sessions = []
+        self.session_titles = {}
+        self.session_states = {}
+        self.session_view_mode = "tabs"
+        self.last_tab_session = None
 
         self.bridge = UiBridge()
         self.bridge.host_status.connect(self._set_status)
@@ -1319,6 +1358,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.remote_page)
         self.setCentralWidget(self.stack)
         self.stack.setCurrentWidget(self.dashboard_page)
+        self._update_session_ui()
 
     def _build_dashboard_page(self):
         root = QWidget()
@@ -1331,42 +1371,76 @@ class MainWindow(QMainWindow):
         header = QFrame()
         header.setObjectName("Header")
         hl = QHBoxLayout(header)
-        hl.setContentsMargins(26,16,26,16)
-        hl.setSpacing(12)
+        hl.setContentsMargins(30,15,30,15)
+        hl.setSpacing(14)
 
         logo = QLabel()
         pix = QPixmap(resource_path("assets/conectapc-logo.png"))
-        logo.setPixmap(pix.scaled(58,58,Qt.KeepAspectRatio,Qt.SmoothTransformation))
-        logo.setFixedSize(64,64)
+        logo.setPixmap(pix.scaled(52,52,Qt.KeepAspectRatio,Qt.SmoothTransformation))
+        logo.setFixedSize(58,58)
         hl.addWidget(logo)
 
         title_box = QVBoxLayout()
+        title_box.setSpacing(1)
         title = QLabel(APP_NAME)
         title.setObjectName("AppTitle")
         title_box.addWidget(title)
-        subtitle = QLabel("Suporte remoto simples e rápido")
-        subtitle.setObjectName("Muted")
+        subtitle = QLabel("Suporte remoto seguro")
+        subtitle.setObjectName("BrandSubtitle")
         title_box.addWidget(subtitle)
         hl.addLayout(title_box)
 
         hl.addStretch(1)
 
+        status_box = QVBoxLayout()
+        status_box.setSpacing(5)
+        status_caption = QLabel("STATUS DE CONEXÃO")
+        status_caption.setObjectName("HeaderEyebrow")
+        status_caption.setAlignment(Qt.AlignRight)
+        status_box.addWidget(status_caption)
+
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
         self.status_badge = QLabel("LAN inicializando…")
         self.status_badge.setObjectName("StatusOffline")
-        hl.addWidget(self.status_badge)
+        status_row.addWidget(self.status_badge)
 
         self.internet_badge = QLabel("Internet inicializando…")
         self.internet_badge.setObjectName("StatusOffline")
-        hl.addWidget(self.internet_badge)
+        status_row.addWidget(self.internet_badge)
+        status_box.addLayout(status_row)
+        hl.addLayout(status_box)
 
         outer.addWidget(header)
 
         body = QWidget()
+        body.setMinimumWidth(0)
         body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(26,20,26,18)
-        body_layout.setSpacing(16)
+        body_layout.setContentsMargins(30,18,30,16)
+        body_layout.setSpacing(14)
+
+        intro = QHBoxLayout()
+        intro_text = QVBoxLayout()
+        intro_text.setSpacing(2)
+        page_title = QLabel("Nova sessão")
+        page_title.setObjectName("PageTitle")
+        intro_text.addWidget(page_title)
+        page_subtitle = QLabel(
+            "Conecte-se a outro computador ou compartilhe seu endereço de acesso."
+        )
+        page_subtitle.setObjectName("PageSubtitle")
+        page_subtitle.setWordWrap(True)
+        page_subtitle.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        intro_text.addWidget(page_subtitle)
+        intro.addLayout(intro_text, 1)
+
+        secure_badge = QLabel("●  LAN disponível")
+        secure_badge.setObjectName("SecureBadge")
+        intro.addWidget(secure_badge, 0, Qt.AlignBottom)
+        body_layout.addLayout(intro)
 
         cards_container = QWidget()
+        cards_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         cards = QHBoxLayout(cards_container)
         cards.setContentsMargins(0,0,0,0)
         cards.setSpacing(16)
@@ -1374,19 +1448,36 @@ class MainWindow(QMainWindow):
         # Este computador
         local_card = QFrame()
         local_card.setObjectName("LocalCard")
+        local_card.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Maximum)
         ll = QVBoxLayout(local_card)
-        ll.setContentsMargins(22,18,22,18)
-        ll.setSpacing(7)
+        ll.setContentsMargins(20,17,20,17)
+        ll.setSpacing(10)
 
-        local_title = QLabel("Este computador")
+        local_head = QHBoxLayout()
+        local_head.setSpacing(8)
+        local_title = QLabel("Este dispositivo")
         local_title.setObjectName("CardTitle")
-        local_title.setStyleSheet("color:#17823A;")
-        ll.addWidget(local_title)
+        local_head.addWidget(local_title)
+        local_head.addStretch(1)
+        local_ready = QLabel("ONLINE")
+        local_ready.setObjectName("AvailabilityBadge")
+        local_head.addWidget(local_ready)
+        ll.addLayout(local_head)
 
-        lbl_id = QLabel("Seu ID")
-        lbl_id.setObjectName("Muted")
-        ll.addWidget(lbl_id)
+        local_subtitle = QLabel("Compartilhe seu endereço e o código para receber acesso.")
+        local_subtitle.setObjectName("CardDescription")
+        local_subtitle.setWordWrap(True)
+        local_subtitle.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        ll.addWidget(local_subtitle)
 
+        id_field = QFrame()
+        id_field.setObjectName("IdentityField")
+        id_field_layout = QVBoxLayout(id_field)
+        id_field_layout.setContentsMargins(14,9,12,9)
+        id_field_layout.setSpacing(3)
+        lbl_id = QLabel("SEU ENDEREÇO")
+        lbl_id.setObjectName("FieldEyebrow")
+        id_field_layout.addWidget(lbl_id)
         idrow = QHBoxLayout()
         self.id_value = QLabel(pretty_id(self.session_id))
         self.id_value.setObjectName("LocalValue")
@@ -1396,16 +1487,18 @@ class MainWindow(QMainWindow):
         copy_id.setToolTip("Copiar ID")
         copy_id.clicked.connect(lambda: QApplication.clipboard().setText(self.session_id))
         idrow.addWidget(copy_id)
-        ll.addLayout(idrow)
+        id_field_layout.addLayout(idrow)
+        ll.addWidget(id_field)
 
-        sep = QFrame()
-        sep.setFixedHeight(1)
-        sep.setStyleSheet("background:#DCEFE1;")
-        ll.addWidget(sep)
-
+        pin_field = QFrame()
+        pin_field.setObjectName("IdentityField")
+        pin_field_layout = QVBoxLayout(pin_field)
+        pin_field_layout.setContentsMargins(14,9,12,9)
+        pin_field_layout.setSpacing(3)
         lbl_pin = QLabel("Código temporário")
-        lbl_pin.setObjectName("Muted")
-        ll.addWidget(lbl_pin)
+        lbl_pin.setText("CÓDIGO TEMPORÁRIO")
+        lbl_pin.setObjectName("FieldEyebrow")
+        pin_field_layout.addWidget(lbl_pin)
 
         pinrow = QHBoxLayout()
         self.pin_value = QLabel(self.pin)
@@ -1416,10 +1509,11 @@ class MainWindow(QMainWindow):
         copy_pin.setToolTip("Copiar código temporário")
         copy_pin.clicked.connect(lambda: QApplication.clipboard().setText(self.pin))
         pinrow.addWidget(copy_pin)
-        ll.addLayout(pinrow)
+        pin_field_layout.addLayout(pinrow)
+        ll.addWidget(pin_field)
 
-        self.incoming_label = QLabel("Nenhuma sessão recebida")
-        self.incoming_label.setObjectName("Muted")
+        self.incoming_label = QLabel("●  Aguardando solicitação de acesso")
+        self.incoming_label.setObjectName("IncomingStatus")
         ll.addWidget(self.incoming_label)
 
         cards.addWidget(local_card, 1)
@@ -1427,20 +1521,32 @@ class MainWindow(QMainWindow):
         # Acessar
         remote_card = QFrame()
         remote_card.setObjectName("RemoteCard")
+        remote_card.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Maximum)
         rl = QVBoxLayout(remote_card)
-        rl.setContentsMargins(22,18,22,18)
-        rl.setSpacing(10)
+        rl.setContentsMargins(20,17,20,17)
+        rl.setSpacing(9)
 
-        rt = QLabel("Acessar outro computador")
+        remote_head = QHBoxLayout()
+        rt = QLabel("Endereço remoto")
         rt.setObjectName("CardTitle")
-        rt.setStyleSheet("color:#0B67AB;")
-        rl.addWidget(rt)
+        remote_head.addWidget(rt)
+        remote_head.addStretch(1)
+        remote_badge = QLabel("CONECTAR")
+        remote_badge.setObjectName("PrimaryBadge")
+        remote_head.addWidget(remote_badge)
+        rl.addLayout(remote_head)
+
+        remote_subtitle = QLabel("Digite o endereço e o código exibidos no dispositivo remoto.")
+        remote_subtitle.setObjectName("CardDescription")
+        remote_subtitle.setWordWrap(True)
+        remote_subtitle.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        rl.addWidget(remote_subtitle)
 
         labels = QHBoxLayout()
-        lid = QLabel("ID")
-        lid.setObjectName("Muted")
-        lpin = QLabel("Código")
-        lpin.setObjectName("Muted")
+        lid = QLabel("ID do computador")
+        lid.setObjectName("FieldLabel")
+        lpin = QLabel("Código temporário")
+        lpin.setObjectName("FieldLabel")
         labels.addWidget(lid, 3)
         labels.addWidget(lpin, 1)
         rl.addLayout(labels)
@@ -1465,6 +1571,7 @@ class MainWindow(QMainWindow):
         rl.addWidget(self.connect_btn)
 
         self.login_btn = QPushButton("Entrar como técnico")
+        self.login_btn.setObjectName("Secondary")
         self.login_btn.setEnabled(self.relay.is_ready())
         self.login_btn.clicked.connect(self._login_technician_ui)
         rl.addWidget(self.login_btn)
@@ -1474,77 +1581,134 @@ class MainWindow(QMainWindow):
         self.enroll_btn.clicked.connect(self._enroll_device_ui)
         rl.addWidget(self.enroll_btn)
 
+        access_security = QFrame()
+        access_security.setObjectName("AccessSecurity")
+        access_security_layout = QHBoxLayout(access_security)
+        access_security_layout.setContentsMargins(11,7,11,7)
+        access_security_layout.setSpacing(7)
+        security_icon = QLabel("✓")
+        security_icon.setObjectName("SecurityIcon")
+        access_security_layout.addWidget(security_icon)
         info = QLabel(
-            "O ConectaPC tenta primeiro a rede local. Se o ID não estiver na LAN, "
-            "usa automaticamente o relay. O código é criptografado ponta a ponta, não é salvo e muda após o uso."
+            "Rede local disponível agora  •  Servidor usado automaticamente quando configurado"
         )
         info.setWordWrap(True)
-        info.setObjectName("Muted")
-        rl.addWidget(info)
+        info.setObjectName("SecurityText")
+        info.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        access_security_layout.addWidget(info, 1)
+        rl.addWidget(access_security)
 
         cards.addWidget(remote_card, 1)
         body_layout.addWidget(cards_container)
 
+        self.active_sessions_banner = QFrame()
+        self.active_sessions_banner.setObjectName("ActiveSessions")
+        active_layout = QHBoxLayout(self.active_sessions_banner)
+        active_layout.setContentsMargins(16,11,16,11)
+        active_layout.setSpacing(12)
+
+        active_icon = QLabel("▣")
+        active_icon.setObjectName("ActiveSessionsIcon")
+        active_layout.addWidget(active_icon)
+
+        active_text = QVBoxLayout()
+        active_text.setSpacing(1)
+        self.active_sessions_title = QLabel("Sessões em andamento")
+        self.active_sessions_title.setObjectName("ActiveSessionsTitle")
+        active_text.addWidget(self.active_sessions_title)
+        active_hint = QLabel("As conexões continuam abertas enquanto você inicia outro acesso.")
+        active_hint.setObjectName("Muted")
+        active_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        active_text.addWidget(active_hint)
+        active_layout.addLayout(active_text, 1)
+
+        return_sessions = QPushButton("Voltar às sessões")
+        return_sessions.setObjectName("PrimaryCompact")
+        return_sessions.clicked.connect(self.show_remote)
+        active_layout.addWidget(return_sessions)
+        self.active_sessions_banner.hide()
+        body_layout.addWidget(self.active_sessions_banner)
+
         # Recentes
         recent_card = QFrame()
         recent_card.setObjectName("Card")
+        recent_card.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Maximum)
         rcl = QVBoxLayout(recent_card)
         rcl.setContentsMargins(20,16,20,16)
         rcl.setSpacing(10)
 
         recent_header = QHBoxLayout()
-        recent_title = QLabel("Últimos acessos")
+        recent_heading = QVBoxLayout()
+        recent_heading.setSpacing(1)
+        recent_title = QLabel("Sessões recentes")
         recent_title.setObjectName("SectionTitle")
-        recent_header.addWidget(recent_title)
+        recent_heading.addWidget(recent_title)
+        recent_subtitle = QLabel("Seus computadores acessados ficam disponíveis aqui.")
+        recent_subtitle.setObjectName("CardDescription")
+        recent_subtitle.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        recent_heading.addWidget(recent_subtitle)
+        recent_header.addLayout(recent_heading)
         recent_header.addStretch(1)
 
         self.clear_recents_btn = QPushButton("Limpar histórico")
+        self.clear_recents_btn.setObjectName("Ghost")
         self.clear_recents_btn.clicked.connect(self.clear_recents)
         recent_header.addWidget(self.clear_recents_btn)
         rcl.addLayout(recent_header)
 
         self.recents_container = QWidget()
-        self.recents_layout = QVBoxLayout(self.recents_container)
+        self.recents_layout = QGridLayout(self.recents_container)
         self.recents_layout.setContentsMargins(0,0,0,0)
-        self.recents_layout.setSpacing(7)
+        self.recents_layout.setHorizontalSpacing(8)
+        self.recents_layout.setVerticalSpacing(8)
+        for column in range(3):
+            self.recents_layout.setColumnStretch(column, 1)
         rcl.addWidget(self.recents_container)
 
-        body_layout.addWidget(recent_card, 1)
+        body_layout.addWidget(recent_card)
         self.refresh_recents_ui()
 
         # Arquivos / ajuda
         tip = QFrame()
-        tip.setStyleSheet(
-            "QFrame{background:#F7FBFF;border:1px dashed #B7D5EE;border-radius:12px;}"
-        )
+        tip.setObjectName("Tip")
         tip_l = QHBoxLayout(tip)
-        tip_l.setContentsMargins(16,12,16,12)
-        tip_title = QLabel("Dica")
-        tip_title.setStyleSheet("font-weight:700;color:#0B67AB;")
+        tip_l.setContentsMargins(14,9,14,9)
+        tip_l.setSpacing(9)
+        tip_title = QLabel("i")
+        tip_title.setObjectName("TipIcon")
         tip_l.addWidget(tip_title)
         tip_text = QLabel(
-            "Ao conectar, o painel inicial sai da tela e o computador remoto ocupa toda a área de trabalho do ConectaPC."
+            "Cada conexão abre em uma aba. Use “Dividir tela” para acompanhar vários computadores ao mesmo tempo."
         )
-        tip_text.setObjectName("Muted")
+        tip_text.setObjectName("TipText")
         tip_text.setWordWrap(True)
+        tip_text.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         tip_l.addWidget(tip_text, 1)
         body_layout.addWidget(tip)
+        body_layout.addStretch(1)
 
-        outer.addWidget(body, 1)
+        dashboard_scroll = QScrollArea()
+        dashboard_scroll.setObjectName("DashboardScroll")
+        dashboard_scroll.setWidgetResizable(True)
+        dashboard_scroll.setFrameShape(QFrame.NoFrame)
+        dashboard_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        dashboard_scroll.setWidget(body)
+        outer.addWidget(dashboard_scroll, 1)
 
         footer = QFrame()
         footer.setObjectName("Footer")
         fl = QHBoxLayout(footer)
-        fl.setContentsMargins(26,10,26,10)
-        left = QLabel("Criptografia E2E  •  Consentimento  •  MFA no relay")
-        left.setObjectName("Muted")
+        fl.setContentsMargins(30,9,30,9)
+        left = QLabel("●  Conexão local ativa  •  Criptografia ponta a ponta  •  Consentimento")
+        left.setObjectName("FooterSecurity")
         fl.addWidget(left)
         fl.addStretch(1)
         ver = QLabel(f"{APP_NAME} {APP_VERSION}")
-        ver.setObjectName("Muted")
+        ver.setObjectName("FooterVersion")
         fl.addWidget(ver)
 
         self.update_btn = QPushButton("Verificar atualizações")
+        self.update_btn.setObjectName("FooterButton")
         self.update_btn.clicked.connect(self._check_updates)
         fl.addWidget(self.update_btn)
 
@@ -1579,12 +1743,31 @@ class MainWindow(QMainWindow):
         logo.setFixedSize(36,36)
         top.addWidget(logo)
 
-        title = QLabel("Sessão remota")
+        title = QLabel("Central de sessões")
         title.setObjectName("SectionTitle")
         top.addWidget(title)
+
+        self.session_count_badge = QLabel("Nenhuma sessão")
+        self.session_count_badge.setObjectName("SessionCount")
+        top.addWidget(self.session_count_badge)
         top.addStretch(1)
 
-        new_session = QPushButton("Nova conexão")
+        self.tabs_view_btn = QPushButton("▣  Abas")
+        self.tabs_view_btn.setObjectName("ViewMode")
+        self.tabs_view_btn.setCheckable(True)
+        self.tabs_view_btn.setChecked(True)
+        self.tabs_view_btn.clicked.connect(lambda: self._set_session_view("tabs"))
+        top.addWidget(self.tabs_view_btn)
+
+        self.split_view_btn = QPushButton("▦  Dividir tela")
+        self.split_view_btn.setObjectName("ViewMode")
+        self.split_view_btn.setCheckable(True)
+        self.split_view_btn.setToolTip("Mostra dois ou mais computadores ao mesmo tempo")
+        self.split_view_btn.clicked.connect(lambda: self._set_session_view("split"))
+        top.addWidget(self.split_view_btn)
+
+        new_session = QPushButton("＋  Novo acesso")
+        new_session.setObjectName("PrimaryCompact")
         new_session.clicked.connect(self.show_dashboard)
         top.addWidget(new_session)
 
@@ -1594,11 +1777,27 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self.remote_topbar)
 
+        self.session_views = QStackedWidget()
+
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
+        self.tabs.setDocumentMode(True)
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.tabBar().setExpanding(False)
         self.tabs.tabCloseRequested.connect(self._close_tab)
         self.tabs.currentChanged.connect(self._current_session_changed)
-        layout.addWidget(self.tabs, 1)
+        self.session_views.addWidget(self.tabs)
+
+        self.split_page = QWidget()
+        self.split_page.setObjectName("SplitPage")
+        self.split_layout = QGridLayout(self.split_page)
+        self.split_layout.setContentsMargins(8,8,8,8)
+        self.split_layout.setHorizontalSpacing(8)
+        self.split_layout.setVerticalSpacing(8)
+        self.session_views.addWidget(self.split_page)
+
+        layout.addWidget(self.session_views, 1)
 
         return page
 
@@ -1616,36 +1815,50 @@ class MainWindow(QMainWindow):
             empty.setObjectName("Muted")
             empty.setAlignment(Qt.AlignCenter)
             empty.setStyleSheet("padding:24px;")
-            self.recents_layout.addWidget(empty)
+            self.recents_layout.addWidget(empty, 0, 0, 1, 3)
             return
 
-        for item in self.recents[:6]:
-            row = QFrame()
-            row.setStyleSheet(
-                "QFrame{background:#FAFCFE;border:1px solid #E0E8F0;border-radius:10px;}"
-            )
-            rl = QHBoxLayout(row)
-            rl.setContentsMargins(12,9,12,9)
+        for index, item in enumerate(self.recents[:6]):
+            tile = QFrame()
+            tile.setObjectName("RecentRow")
+            tile.setMinimumHeight(104)
+            tile.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            tile_layout = QVBoxLayout(tile)
+            tile_layout.setContentsMargins(12,10,12,10)
+            tile_layout.setSpacing(7)
+
+            top = QHBoxLayout()
+            top.setSpacing(9)
+            recent_icon = QLabel("PC")
+            recent_icon.setObjectName("RecentIcon")
+            recent_icon.setAlignment(Qt.AlignCenter)
+            recent_icon.setFixedSize(36,36)
+            top.addWidget(recent_icon)
 
             name_box = QVBoxLayout()
+            name_box.setSpacing(1)
             name = QLabel(item.get("name") or "Computador")
-            name.setStyleSheet("font-weight:700;")
+            name.setObjectName("RecentName")
+            name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             name_box.addWidget(name)
 
             details = QLabel(
-                f"ID {pretty_id(item['id'])}  •  {item.get('last_access','')}"
+                f"{pretty_id(item['id'])}  •  {item.get('last_access','')}"
             )
-            details.setObjectName("Muted")
+            details.setObjectName("RecentMeta")
+            details.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             name_box.addWidget(details)
-            rl.addLayout(name_box, 1)
+            top.addLayout(name_box, 1)
+            tile_layout.addLayout(top)
 
-            use_btn = QPushButton("Conectar novamente")
+            use_btn = QPushButton("Conectar")
+            use_btn.setObjectName("RecentAction")
             use_btn.clicked.connect(
                 lambda checked=False, sid=item["id"]: self.use_recent(sid)
             )
-            rl.addWidget(use_btn)
+            tile_layout.addWidget(use_btn)
 
-            self.recents_layout.addWidget(row)
+            self.recents_layout.addWidget(tile, index // 3, index % 3)
 
     def use_recent(self, sid):
         self.remote_id.setText(pretty_id(sid))
@@ -1687,19 +1900,25 @@ class MainWindow(QMainWindow):
             self.showNormal()
         self._set_immersive(False)
         self.stack.setCurrentWidget(self.dashboard_page)
+        self.remote_id.setFocus()
 
     def show_remote(self):
+        if not self.sessions:
+            self.show_dashboard()
+            return
         self.stack.setCurrentWidget(self.remote_page)
-        current = self.tabs.currentWidget()
-        if isinstance(current, RemoteSession):
-            current.screen.setFocus()
+        if self.session_view_mode == "tabs":
+            current = self.tabs.currentWidget()
+            if isinstance(current, RemoteSession):
+                current.screen.setFocus()
 
     def _set_immersive(self, enabled):
         self.remote_topbar.setVisible(not enabled)
         self.tabs.tabBar().setVisible(not enabled)
-        current = self.tabs.currentWidget()
-        if isinstance(current, RemoteSession):
-            current.set_immersive(enabled)
+        targets = self.sessions if self.session_view_mode == "split" else [self.tabs.currentWidget()]
+        for session in targets:
+            if isinstance(session, RemoteSession):
+                session.set_immersive(enabled)
 
     def toggle_fullscreen(self):
         if self.stack.currentWidget() != self.remote_page:
@@ -1721,10 +1940,118 @@ class MainWindow(QMainWindow):
             self.fullscreen_btn.setText("Tela cheia  F11")
 
     def _current_session_changed(self, _index):
+        current = self.tabs.currentWidget()
+        if isinstance(current, RemoteSession):
+            self.last_tab_session = current
         if self.isFullScreen():
-            current = self.tabs.currentWidget()
             if isinstance(current, RemoteSession):
                 current.set_immersive(True)
+
+    def _set_session_view(self, mode):
+        if mode not in {"tabs", "split"}:
+            return
+        if mode == "split" and len(self.sessions) < 2:
+            self.tabs_view_btn.setChecked(True)
+            self.split_view_btn.setChecked(False)
+            return
+        if mode == self.session_view_mode:
+            self.tabs_view_btn.setChecked(mode == "tabs")
+            self.split_view_btn.setChecked(mode == "split")
+            return
+
+        if mode == "split":
+            current = self.tabs.currentWidget()
+            if isinstance(current, RemoteSession):
+                self.last_tab_session = current
+            tab_order = [
+                self.tabs.widget(index) for index in range(self.tabs.count())
+                if isinstance(self.tabs.widget(index), RemoteSession)
+            ]
+            if len(tab_order) == len(self.sessions):
+                self.sessions = tab_order
+            for session in self.sessions:
+                idx = self.tabs.indexOf(session)
+                if idx >= 0:
+                    self.tabs.removeTab(idx)
+                session.set_compact_mode(True)
+            self._refresh_split_layout()
+            self.session_views.setCurrentWidget(self.split_page)
+        else:
+            self._clear_split_layout()
+            for session in self.sessions:
+                session.set_compact_mode(False)
+                self.tabs.addTab(session, self._session_tab_text(session))
+            if self.last_tab_session in self.sessions:
+                self.tabs.setCurrentWidget(self.last_tab_session)
+            self.session_views.setCurrentWidget(self.tabs)
+
+        self.session_view_mode = mode
+        self.tabs_view_btn.setChecked(mode == "tabs")
+        self.split_view_btn.setChecked(mode == "split")
+
+    def _clear_split_layout(self):
+        while self.split_layout.count():
+            item = self.split_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.hide()
+
+    def _refresh_split_layout(self):
+        self._clear_split_layout()
+        count = len(self.sessions)
+        columns = 1 if count <= 1 else (2 if count <= 4 else 3)
+        for index, session in enumerate(self.sessions):
+            row, column = divmod(index, columns)
+            if count == 3 and index == 2:
+                self.split_layout.addWidget(session, row, 0, 1, 2)
+            else:
+                self.split_layout.addWidget(session, row, column)
+            session.show()
+
+    def _session_tab_text(self, session):
+        state = self.session_states.get(session, "connecting")
+        marker = {
+            "connected": "●",
+            "failed": "!",
+            "disconnected": "○",
+            "connecting": "◌",
+        }.get(state, "◌")
+        return f"{marker}  {self.session_titles.get(session, 'Computador')}"
+
+    def _session_state_changed(self, session, state):
+        if session not in self.sessions:
+            return
+        self.session_states[session] = state
+        idx = self.tabs.indexOf(session)
+        if idx >= 0:
+            self.tabs.setTabText(idx, self._session_tab_text(session))
+        self._update_session_ui()
+
+    def _update_session_ui(self):
+        count = len(self.sessions)
+        connected = sum(
+            1 for session in self.sessions
+            if self.session_states.get(session) == "connected"
+        )
+        if count == 0:
+            summary = "Nenhuma sessão"
+        elif count == 1:
+            summary = "1 sessão aberta"
+        else:
+            summary = f"{count} sessões abertas"
+        if connected:
+            summary += f"  •  {connected} conectada" + ("s" if connected != 1 else "")
+
+        self.session_count_badge.setText(summary)
+        self.split_view_btn.setEnabled(count >= 2)
+        self.active_sessions_banner.setVisible(count > 0)
+        if count == 1:
+            self.active_sessions_title.setText("1 sessão continua aberta")
+        elif count > 1:
+            self.active_sessions_title.setText(f"{count} sessões continuam abertas")
+
+        if count < 2 and self.session_view_mode == "split":
+            self._set_session_view("tabs")
 
     def _set_status(self, text, online):
         self.status_badge.setText("● " + text)
@@ -1733,10 +2060,14 @@ class MainWindow(QMainWindow):
         self.status_badge.style().polish(self.status_badge)
 
     def _set_internet_status(self, text, online):
-        self.internet_badge.setText("● " + text)
-        self.internet_badge.setObjectName(
-            "StatusOnline" if online else "StatusOffline"
-        )
+        if not self.relay.enabled:
+            self.internet_badge.setText("○ Servidor opcional")
+            self.internet_badge.setObjectName("StatusOptional")
+        else:
+            self.internet_badge.setText("● " + text)
+            self.internet_badge.setObjectName(
+                "StatusOnline" if online else "StatusOffline"
+            )
         self.internet_badge.style().unpolish(self.internet_badge)
         self.internet_badge.style().polish(self.internet_badge)
         if hasattr(self, "enroll_btn"):
@@ -1746,11 +2077,11 @@ class MainWindow(QMainWindow):
 
     def _set_incoming_count(self, n):
         if n == 0:
-            self.incoming_label.setText("Nenhuma sessão recebida")
+            self.incoming_label.setText("●  Aguardando solicitação de acesso")
         elif n == 1:
-            self.incoming_label.setText("1 sessão recebida")
+            self.incoming_label.setText("●  1 sessão de suporte ativa")
         else:
-            self.incoming_label.setText(f"{n} sessões recebidas")
+            self.incoming_label.setText(f"●  {n} sessões de suporte ativas")
 
     def _set_new_pin(self, pin):
         self.pin = pin
@@ -1882,10 +2213,6 @@ class MainWindow(QMainWindow):
             )
             return
 
-        if self.relay.is_ready() and not self.relay.access_token:
-            if not self._login_technician_ui():
-                return
-
         if sid == self.session_id:
             QMessageBox.warning(self, APP_NAME, "Esse é o ID deste próprio computador.")
             return
@@ -1917,7 +2244,15 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # 2) Fora da LAN: abre um túnel pelo relay.
+        # A decisão de usar o relay volta para a thread da interface. Isso
+        # permite solicitar MFA somente depois de confirmar que o ID não está
+        # disponível na rede local.
+        QApplication.instance().postEvent(
+            self,
+            _RelayFallbackEvent(sid, pin),
+        )
+
+    def _connect_via_relay(self, sid, pin):
         try:
             tunnel, meta = self.relay.open_controller_tunnel(sid)
             known_key = self.known_peers.expected("target:" + sid)
@@ -1945,6 +2280,43 @@ class MainWindow(QMainWindow):
             )
 
     def customEvent(self, event):
+        if isinstance(event, _RelayFallbackEvent):
+            if not self.relay.enabled:
+                self.connect_btn.setEnabled(True)
+                self.connect_btn.setText("Conectar")
+                QMessageBox.information(
+                    self,
+                    APP_NAME,
+                    "Esse ID não foi encontrado na rede local.\n\n"
+                    "O modo local continua disponível sem servidor. Para acessar "
+                    "computadores fora da rede, configure o VPS depois.",
+                )
+                return
+
+            if not self.relay.is_ready():
+                self.connect_btn.setEnabled(True)
+                self.connect_btn.setText("Conectar")
+                QMessageBox.warning(
+                    self,
+                    APP_NAME,
+                    "Esse ID não foi encontrado na rede local e o servidor está indisponível.\n\n"
+                    f"Detalhe: {self.relay.status_detail()}",
+                )
+                return
+
+            if not self.relay.access_token and not self._login_technician_ui():
+                self.connect_btn.setEnabled(True)
+                self.connect_btn.setText("Conectar")
+                return
+
+            self.connect_btn.setText("Conectando pelo servidor…")
+            threading.Thread(
+                target=self._connect_via_relay,
+                args=(event.sid, event.pin),
+                daemon=True,
+            ).start()
+            return
+
         if isinstance(event, _OpenSessionEvent):
             self.connect_btn.setEnabled(True)
             self.connect_btn.setText("Conectar")
@@ -1954,8 +2326,9 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(
                     self,
                     APP_NAME,
-                    "Não foi possível localizar esse ID.\n\n"
-                    "O ConectaPC tentou primeiro a rede local e depois o relay pela internet.\n\n"
+                    "Não foi possível conectar a esse ID.\n\n"
+                    "O computador não foi encontrado na rede local e a tentativa "
+                    "pelo servidor não foi concluída.\n\n"
                     f"Detalhe: {detail}",
                 )
                 return
@@ -1966,8 +2339,16 @@ class MainWindow(QMainWindow):
                 self.relay.record_event,
                 self._remember_peer,
             )
-            idx = self.tabs.addTab(session, event.peer["name"])
-            self.tabs.setCurrentIndex(idx)
+            self.sessions.append(session)
+            self.session_titles[session] = event.peer["name"]
+            self.session_states[session] = "connecting"
+
+            if self.session_view_mode == "tabs":
+                idx = self.tabs.addTab(session, self._session_tab_text(session))
+                self.tabs.setCurrentIndex(idx)
+            else:
+                session.set_compact_mode(True)
+                self._refresh_split_layout()
 
             # Sai do dashboard imediatamente e entrega a janela para a sessão.
             self.show_remote()
@@ -1976,7 +2357,11 @@ class MainWindow(QMainWindow):
                 lambda title, s=session, sid=event.sid:
                     self._session_connected(s, sid, title)
             )
+            session.stateChanged.connect(
+                lambda state, s=session: self._session_state_changed(s, state)
+            )
             session.closed.connect(self._close_session_widget)
+            self._update_session_ui()
 
             self.remote_id.clear()
             self.remote_pin.clear()
@@ -1988,18 +2373,30 @@ class MainWindow(QMainWindow):
         self.known_peers.remember("target:" + sid, public_key, label)
 
     def _session_connected(self, session, sid, title):
+        self.session_titles[session] = title
         idx = self.tabs.indexOf(session)
         if idx >= 0:
-            self.tabs.setTabText(idx, title)
+            self.tabs.setTabText(idx, self._session_tab_text(session))
         self.remember_access(sid, title)
 
     def _close_session_widget(self, session):
         idx = self.tabs.indexOf(session)
         if idx >= 0:
             self.tabs.removeTab(idx)
+        self.split_layout.removeWidget(session)
+        if session in self.sessions:
+            self.sessions.remove(session)
+        self.session_titles.pop(session, None)
+        self.session_states.pop(session, None)
+        if self.last_tab_session is session:
+            self.last_tab_session = None
         session.deleteLater()
 
-        if self.tabs.count() == 0:
+        if self.session_view_mode == "split" and self.sessions:
+            self._refresh_split_layout()
+        self._update_session_ui()
+
+        if not self.sessions:
             self.show_dashboard()
 
     def _close_tab(self, idx):
@@ -2010,10 +2407,8 @@ class MainWindow(QMainWindow):
             self.tabs.removeTab(idx)
 
     def closeEvent(self, event):
-        for idx in range(self.tabs.count()-1, -1, -1):
-            widget = self.tabs.widget(idx)
-            if isinstance(widget, RemoteSession):
-                widget.disconnect()
+        for session in list(self.sessions):
+            session.disconnect()
         self.relay.stop()
         self.host.stop()
         self.discovery.stop()
