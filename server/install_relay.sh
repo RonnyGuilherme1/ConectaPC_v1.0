@@ -15,6 +15,7 @@ install -d -o root -g conectapc -m 0750 /etc/conectapc
 install -m 0755 "${base_dir}/relay_server.py" /opt/conectapc-relay/
 install -m 0644 "${base_dir}/security_store.py" /opt/conectapc-relay/
 install -m 0755 "${base_dir}/manage_security.py" /opt/conectapc-relay/
+install -m 0755 "${base_dir}/TESTAR_RELAY_LOCAL.py" /opt/conectapc-relay/
 install -m 0644 "${base_dir}/systemd/conectapc-relay.service" /etc/systemd/system/
 chown -R conectapc:conectapc /opt/conectapc-relay
 

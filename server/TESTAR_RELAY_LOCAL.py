@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Teste autenticado do relay usando tráfego artificial HELLO/WORLD.
 
-Inicie o relay com --allow-plain e --db apontando para um banco temporário;
-depois passe host, porta e o mesmo caminho do banco a este script.
+O modo padrão continua atendendo o laboratório local sem TLS. Para validar a
+implantação real, execute este script na VPS com ``--tls``, usando o mesmo banco
+do serviço e o domínio público como host/server-name.
 """
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import secrets
 import socket
-import sys
+import ssl
 import threading
 import time
 from pathlib import Path
@@ -44,6 +46,26 @@ def public_key():
     return base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
 
 
+class RelayConnector:
+    def __init__(self, host, port, *, use_tls=False, server_name="", ca_file=""):
+        self.host = host
+        self.port = port
+        self.use_tls = use_tls
+        self.server_name = server_name or host
+        self.ca_file = ca_file
+        self.context = ssl.create_default_context(cafile=ca_file or None) if use_tls else None
+
+    def connect(self):
+        raw = socket.create_connection((self.host, self.port), timeout=5)
+        if not self.context:
+            return raw
+        try:
+            return self.context.wrap_socket(raw, server_hostname=self.server_name)
+        except Exception:
+            raw.close()
+            raise
+
+
 def provision(db_path):
     store = SecurityStore(db_path)
     host_id, controller_id = random_id(), random_id()
@@ -67,8 +89,8 @@ def provision(db_path):
     }
 
 
-def register(host, port, device_id, key, token, name):
-    control = socket.create_connection((host, port), timeout=5)
+def register(connector, device_id, key, token, name):
+    control = connector.connect()
     sendj(control, {
         "mode": "control", "id": device_id, "name": name,
         "public_key": key, "device_token": token,
@@ -78,14 +100,20 @@ def register(host, port, device_id, key, token, name):
     return control
 
 
-def run(host, port, db_path):
+def run(host, port, db_path, *, use_tls=False, server_name="", ca_file=""):
+    connector = RelayConnector(
+        host, port, use_tls=use_tls, server_name=server_name, ca_file=ca_file
+    )
     c = provision(db_path)
-    host_control = register(host, port, c["host_id"], c["host_key"], c["host_token"], "PC-Teste")
+    host_control = register(
+        connector, c["host_id"], c["host_key"], c["host_token"], "PC-Teste"
+    )
     controller_control = register(
-        host, port, c["controller_id"], c["controller_key"], c["controller_token"], "Console-Teste"
+        connector, c["controller_id"], c["controller_key"],
+        c["controller_token"], "Console-Teste"
     )
 
-    login = socket.create_connection((host, port), timeout=5)
+    login = connector.connect()
     sendj(login, {
         "mode": "login", "controller_id": c["controller_id"], "username": c["username"],
         "password": c["password"], "otp": c["otp"],
@@ -99,7 +127,7 @@ def run(host, port, db_path):
         incoming = recvj(host_control)
         assert incoming.get("type") == "incoming"
         assert incoming.get("controller_key") == c["controller_key"]
-        tunnel = socket.create_connection((host, port), timeout=5)
+        tunnel = connector.connect()
         sendj(tunnel, {
             "mode": "host_tunnel", "session": incoming["session"], "id": c["host_id"],
             "public_key": c["host_key"], "device_token": c["host_token"],
@@ -112,7 +140,7 @@ def run(host, port, db_path):
 
     thread = threading.Thread(target=host_side, daemon=True)
     thread.start()
-    controller = socket.create_connection((host, port), timeout=5)
+    controller = connector.connect()
     sendj(controller, {
         "mode": "request", "target": c["host_id"], "controller_id": c["controller_id"],
         "access_token": login_reply["access_token"],
@@ -127,14 +155,36 @@ def run(host, port, db_path):
     controller.close()
     host_control.close()
     controller_control.close()
-    print("RELAY_OK: dispositivos, MFA, autorização, identidades e túnel funcionando.")
+    transport = "TLS verificado" if use_tls else "TCP sem TLS (laboratório)"
+    print(
+        "RELAY_OK: dispositivos, MFA, autorização, identidades e túnel funcionando. "
+        f"Transporte: {transport}."
+    )
 
 
 def main():
-    host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 45443
-    db_path = Path(sys.argv[3]) if len(sys.argv) > 3 else Path("relay-test.db")
-    run(host, port, db_path)
+    parser = argparse.ArgumentParser(description="Valida autenticação e túnel do ConectaPC Relay")
+    parser.add_argument("host", nargs="?", default="127.0.0.1")
+    parser.add_argument("port", nargs="?", type=int, default=45443)
+    parser.add_argument("db_path", nargs="?", type=Path, default=Path("relay-test.db"))
+    parser.add_argument("--tls", action="store_true", help="exige TLS e valida o certificado")
+    parser.add_argument("--server-name", default="", help="nome DNS esperado no certificado")
+    parser.add_argument("--ca-file", default="", help="CA adicional para laboratório TLS")
+    args = parser.parse_args()
+    if (args.server_name and not args.tls):
+        parser.error("--server-name exige --tls")
+    if args.ca_file and not args.tls:
+        parser.error("--ca-file exige --tls")
+    if args.ca_file and not Path(args.ca_file).is_file():
+        parser.error("arquivo informado em --ca-file não existe")
+    run(
+        args.host,
+        args.port,
+        args.db_path,
+        use_tls=args.tls,
+        server_name=args.server_name,
+        ca_file=args.ca_file,
+    )
 
 
 if __name__ == "__main__":

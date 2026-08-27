@@ -96,11 +96,11 @@ Builds de desenvolvimento podem ficar sem assinatura. Para release, defina `CONE
 
 ## Preparar um piloto
 
-    .\GERAR_PACOTE_RELAY.ps1
+    .\PREPARAR_ENTREGA_COORDENADOR.ps1
     .\CONFIGURAR_CLIENTE_PRODUCAO.ps1 -RelayHost relay.suaempresa.com.br
-    .\VERIFICAR_PILOTO.ps1
+    .\VERIFICAR_PILOTO.ps1 -Profile VpsTest
 
-O preflight testa configuração segura, DNS, TLS, chave de atualização, certificado Authenticode, testes automatizados, dependências e assinatura do Setup. Ele retorna código 2 enquanto houver qualquer bloqueio obrigatório.
+O preflight possui os perfis `Preparation`, `VpsTest` e `Production`. A preparação valida código, testes e pacote sem inventar o domínio; o teste VPS exige DNS/TLS e o Setup de homologação; produção acrescenta chave de atualização e Authenticode. Todos retornam código 2 enquanto houver qualquer bloqueio obrigatório.
 
 ## Limites conhecidos
 

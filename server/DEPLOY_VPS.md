@@ -70,6 +70,23 @@ Revogar no banco bloqueia novos acessos. Para derrubar imediatamente conexões T
 
 O relay registra metadados de auditoria em SQLite e retém 90 dias por padrão. Faça backup criptografado de `/var/lib/conectapc/relay.db`, monitore CPU/memória/banda, expiração TLS, falhas de login e volume de sessões.
 
+## Teste integrado com TLS
+
+Depois que o DNS e o certificado estiverem válidos e o serviço estiver ativo,
+execute na própria VPS, substituindo o domínio:
+
+    sudo -u conectapc python3 /opt/conectapc-relay/TESTAR_RELAY_LOCAL.py \
+      relay.suaempresa.com.br 443 /var/lib/conectapc/relay.db \
+      --tls --server-name relay.suaempresa.com.br
+
+O resultado esperado começa com `RELAY_OK` e confirma explicitamente
+`Transporte: TLS verificado`. O teste cria dispositivos e um técnico sintéticos
+no banco de auditoria; não use nomes ou credenciais reais.
+
+Para um certificado de laboratório assinado por uma CA privada, acrescente
+`--ca-file /caminho/ca.crt`. Não existe opção para desabilitar a validação do
+certificado no teste TLS.
+
 O relay permanece de processo único e memória local. Antes de alta disponibilidade/horizontalização, será necessário um coordenador compartilhado para presença e sessões.
 
 ## Laboratório local

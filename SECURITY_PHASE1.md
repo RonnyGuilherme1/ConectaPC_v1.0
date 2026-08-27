@@ -19,7 +19,7 @@
 
 No Windows de desenvolvimento, gere primeiro o pacote sem segredos:
 
-    .\GERAR_PACOTE_RELAY.ps1
+    .\PREPARAR_ENTREGA_COORDENADOR.ps1
 
 Envie `dist_relay\conectapc-relay-2.1.0.zip` para a VPS, extraia e execute `sudo ./install_relay.sh` depois de instalar o certificado TLS nos caminhos documentados.
 
@@ -61,7 +61,11 @@ Também é possível revogar um técnico e todas as sessões dele com `disable-t
 Antes do build, configure `relay_config.json` com `enabled`, domínio, porta 443 e TLS. Nunca distribua `allow_insecure_dev=true`.
 
     .\CONFIGURAR_CLIENTE_PRODUCAO.ps1 -RelayHost relay.suaempresa.com.br
-    .\VERIFICAR_PILOTO.ps1
+    .\VERIFICAR_PILOTO.ps1 -Profile VpsTest
+
+Use `-Profile Preparation` antes de receber o domínio, `-Profile VpsTest` para
+a homologação pública sem assinatura comercial e `-Profile Production` para a
+liberação oficial com atualização assinada e Authenticode.
 
 A versão 2.1 é incompatível com o protocolo 2.0. Atualize console e clientes em conjunto.
 
